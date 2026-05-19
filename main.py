@@ -16,7 +16,7 @@ import anthropic
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODELO  = "claude-sonnet-4-6"
+MODELO  = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = 2000
 
 # Domínios autorizados a usar o chat (adicione o seu domínio aqui)
@@ -114,6 +114,22 @@ def raiz():
 @app.get("/health")
 def health():
     return {"ok": True, "modelo": MODELO}
+
+@app.get("/test-api")
+async def test_api():
+    """Endpoint de diagnóstico — testa a conexão com a Anthropic."""
+    if not API_KEY:
+        return {"erro": "API_KEY não configurada"}
+    try:
+        client = anthropic.Anthropic(api_key=API_KEY)
+        r = client.messages.create(
+            model=MODELO,
+            max_tokens=10,
+            messages=[{"role": "user", "content": "Olá"}],
+        )
+        return {"ok": True, "modelo": MODELO, "resposta": r.content[0].text}
+    except Exception as e:
+        return {"erro": str(e), "tipo": type(e).__name__, "modelo": MODELO}
 
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
