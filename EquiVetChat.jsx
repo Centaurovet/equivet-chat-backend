@@ -3,7 +3,7 @@ import { useState, useRef, useEffect } from "react";
 // ── Configure a URL do seu backend aqui ──────────────────────────────────────
 // Após o deploy no Railway/Render, substitua pela URL gerada.
 // Exemplo: "https://equivet-chat.railway.app"
-const BACKEND_URL = "http://localhost:8000";
+const BACKEND_URL = "https://web-production-2f5bf.up.railway.app";
 
 // ── Perfis ────────────────────────────────────────────────────────────────────
 const PROFILES = [
