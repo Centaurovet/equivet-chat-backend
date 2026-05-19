@@ -134,11 +134,19 @@ async def chat(req: ChatRequest, request: Request):
     # Chama o Claude
     try:
         client = anthropic.Anthropic(api_key=API_KEY)
+        # A Anthropic exige que o primeiro item seja sempre "user"
+        # Remove mensagens iniciais do assistente (boas-vindas do frontend)
+        msgs = [{"role": m.role, "content": m.content} for m in req.mensagens]
+        primeiro_user = next((i for i, m in enumerate(msgs) if m["role"] == "user"), None)
+        if primeiro_user is None:
+            raise HTTPException(status_code=400, detail="Nenhuma mensagem do usuário.")
+        msgs = msgs[primeiro_user:]
+
         resposta = client.messages.create(
             model=MODELO,
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPTS[req.perfil],
-            messages=[{"role": m.role, "content": m.content} for m in req.mensagens],
+            messages=msgs,
         )
         texto = resposta.content[0].text
         return {"resposta": texto}
