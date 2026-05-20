@@ -16,6 +16,7 @@ import anthropic
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "")
+API_SECRET     = os.environ.get("API_SECRET", "")   # token obrigatório nos headers do frontend
 MODELO_SONNET  = "claude-sonnet-4-6"
 MODELO_HAIKU   = "claude-haiku-4-5-20251001"
 MAX_TOKENS     = 2000
@@ -137,6 +138,12 @@ async def test_api():
 
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
+    # Verifica token secreto (proteção contra uso não autorizado)
+    if API_SECRET:
+        token = request.headers.get("X-API-Key", "")
+        if token != API_SECRET:
+            raise HTTPException(status_code=401, detail="Não autorizado.")
+
     # Rate limiting
     ip = request.client.host
     verificar_rate_limit(ip)
