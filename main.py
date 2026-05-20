@@ -1,13 +1,14 @@
 """
-EquiVet IA — Backend Proxy
-Protege a API Key da Anthropic e adiciona rate limiting.
+EquiVet IA — Backend Proxy com RAG
+Protege a API Key da Anthropic, adiciona rate limiting e busca literatura.
 Deploy: Railway / Render / qualquer servidor Python.
 """
 
 import os
+import re
 import time
 from collections import defaultdict
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,22 +18,25 @@ import anthropic
 # ── Configuração ──────────────────────────────────────────────────────────────
 API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "")
 API_SECRET     = os.environ.get("API_SECRET", "")   # token obrigatório nos headers do frontend
+SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
 MODELO_SONNET  = "claude-sonnet-4-6"
 MODELO_HAIKU   = "claude-haiku-4-5-20251001"
 MAX_TOKENS     = 2000
+RAG_CHUNKS     = 4   # número de trechos da literatura a incluir por resposta
 
 # Perfis que usam Sonnet (raciocínio clínico profundo)
 PERFIS_SONNET  = {"vet", "farrier"}
 
-# Domínios autorizados a usar o chat (adicione o seu domínio aqui)
+# Domínios autorizados a usar o chat
 ORIGENS_PERMITIDAS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 # Rate limiting simples: máx. requisições por janela de tempo por IP
-RATE_LIMITE      = int(os.environ.get("RATE_LIMIT", "15"))       # requisições
-RATE_JANELA_SEG  = int(os.environ.get("RATE_WINDOW_SEC", "60"))  # por minuto
+RATE_LIMITE      = int(os.environ.get("RATE_LIMIT", "15"))
+RATE_JANELA_SEG  = int(os.environ.get("RATE_WINDOW_SEC", "60"))
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="EquiVet IA Chat API", version="1.0")
+app = FastAPI(title="EquiVet IA Chat API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,11 +55,90 @@ def verificar_rate_limit(ip: str):
     if len(_contadores[ip]) >= RATE_LIMITE:
         raise HTTPException(
             status_code=429,
-            detail=f"Muitas requisições. Aguarde um momento e tente novamente."
+            detail="Muitas requisições. Aguarde um momento e tente novamente."
         )
     _contadores[ip].append(agora)
 
-# ── System prompts (espelho do frontend) ─────────────────────────────────────
+# ── RAG: busca de literatura no Supabase ─────────────────────────────────────
+# Stopwords PT/EN/ES a ignorar na extração de keywords
+_STOPWORDS = {
+    "a","o","as","os","um","uma","de","do","da","dos","das","em","no","na",
+    "nos","nas","e","é","são","foi","que","se","por","para","com","como",
+    "não","tem","ter","ser","this","the","and","for","with","can","you",
+    "your","que","del","los","las","una","con","por","para","como","es",
+    "en","se","vc","eu","ele","ela","meu","seu","seu","está","isso","isto",
+    "qual","quais","quando","onde","quem","mais","muito","bem","mas","ou",
+}
+
+def extrair_keywords(texto: str) -> List[str]:
+    """Extrai palavras com ≥4 letras, ignorando stopwords."""
+    palavras = re.findall(r"[a-záàâãéêíóôõúüçñ]+", texto.lower())
+    return [p for p in palavras if len(p) >= 4 and p not in _STOPWORDS]
+
+def buscar_literatura(pergunta: str) -> str:
+    """
+    Busca chunks relevantes no Supabase por keyword (ilike).
+    Retorna string formatada para injetar no system prompt, ou "" se vazio.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return ""
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        keywords = extrair_keywords(pergunta)
+        if not keywords:
+            return ""
+
+        vistos: set = set()
+        chunks: list = []
+
+        # Tenta cada keyword até ter RAG_CHUNKS trechos únicos
+        for kw in keywords[:6]:
+            if len(chunks) >= RAG_CHUNKS:
+                break
+            try:
+                res = (
+                    sb.table("literatura")
+                    .select("chunk_id,book,author,chapter,page_start,text")
+                    .ilike("text", f"%{kw}%")
+                    .limit(3)
+                    .execute()
+                )
+                for row in res.data:
+                    cid = row.get("chunk_id") or row["text"][:60]
+                    if cid not in vistos:
+                        vistos.add(cid)
+                        chunks.append(row)
+            except Exception:
+                continue
+
+        if not chunks:
+            return ""
+
+        linhas = []
+        for r in chunks[:RAG_CHUNKS]:
+            ref = r.get("book", "Referência")
+            cap = r.get("chapter") or ""
+            pag = r.get("page_start") or ""
+            ref_str = f"{ref}"
+            if cap:
+                ref_str += f" — {cap}"
+            if pag:
+                ref_str += f", p.{pag}"
+            linhas.append(f"[{ref_str}]\n{r['text']}")
+
+        return "\n\n---\n\n".join(linhas)
+
+    except Exception:
+        return ""
+
+# ── System prompts ────────────────────────────────────────────────────────────
+_BASE_RAG = (
+    "\n\nQuando relevante, cite as referências bibliográficas fornecidas acima "
+    "indicando o livro e a página. Se os trechos não forem pertinentes à pergunta, ignore-os."
+)
+
 SYSTEM_PROMPTS = {
     "vet": (
         "Você é o EquiVet IA, assistente clínico de medicina equina desenvolvido pela Centaurovet. "
@@ -108,37 +191,52 @@ class Mensagem(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    perfil: str          # "vet" | "owner" | "trainer" | "farrier"
+    perfil: str
     mensagens: List[Mensagem]
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def raiz():
-    return {"status": "EquiVet IA Chat API online"}
+    return {"status": "EquiVet IA Chat API online", "version": "2.0", "rag": bool(SUPABASE_URL)}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "modelo": MODELO}
+    return {"ok": True, "sonnet": MODELO_SONNET, "haiku": MODELO_HAIKU, "rag": bool(SUPABASE_URL)}
 
 @app.get("/test-api")
 async def test_api():
-    """Endpoint de diagnóstico — testa a conexão com a Anthropic."""
+    """Diagnóstico: testa conexão com Anthropic e Supabase."""
+    resultado: dict = {}
     if not API_KEY:
-        return {"erro": "API_KEY não configurada"}
-    try:
-        client = anthropic.Anthropic(api_key=API_KEY)
-        r = client.messages.create(
-            model=MODELO_SONNET,
-            max_tokens=10,
-            messages=[{"role": "user", "content": "Olá"}],
-        )
-        return {"ok": True, "sonnet": MODELO_SONNET, "haiku": MODELO_HAIKU, "resposta": r.content[0].text}
-    except Exception as e:
-        return {"erro": str(e), "tipo": type(e).__name__, "modelo": MODELO}
+        resultado["anthropic"] = "API_KEY não configurada"
+    else:
+        try:
+            client = anthropic.Anthropic(api_key=API_KEY)
+            r = client.messages.create(
+                model=MODELO_SONNET,
+                max_tokens=10,
+                messages=[{"role": "user", "content": "Olá"}],
+            )
+            resultado["anthropic"] = {"ok": True, "resposta": r.content[0].text}
+        except Exception as e:
+            resultado["anthropic"] = {"erro": str(e)}
+
+    if not SUPABASE_URL:
+        resultado["supabase"] = "SUPABASE_URL não configurada"
+    else:
+        try:
+            from supabase import create_client
+            sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+            c = sb.table("literatura").select("chunk_id", count="exact").limit(1).execute()
+            resultado["supabase"] = {"ok": True, "total_chunks": c.count}
+        except Exception as e:
+            resultado["supabase"] = {"erro": str(e)}
+
+    return resultado
 
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
-    # Verifica token secreto (proteção contra uso não autorizado)
+    # Verifica token secreto
     if API_SECRET:
         token = request.headers.get("X-API-Key", "")
         if token != API_SECRET:
@@ -158,24 +256,42 @@ async def chat(req: ChatRequest, request: Request):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
 
+    # Filtra mensagens (Anthropic exige que o primeiro item seja "user")
+    msgs = [{"role": m.role, "content": m.content} for m in req.mensagens]
+    primeiro_user = next((i for i, m in enumerate(msgs) if m["role"] == "user"), None)
+    if primeiro_user is None:
+        raise HTTPException(status_code=400, detail="Nenhuma mensagem do usuário.")
+    msgs = msgs[primeiro_user:]
+
+    # Pega a última mensagem do usuário para busca RAG
+    ultima_msg_user = next(
+        (m["content"] for m in reversed(msgs) if m["role"] == "user"), ""
+    )
+
+    # Busca literatura relevante
+    contexto_literatura = buscar_literatura(ultima_msg_user)
+
+    # Monta system prompt: base + literatura (se encontrou)
+    system = SYSTEM_PROMPTS[req.perfil]
+    if contexto_literatura:
+        system = (
+            system
+            + "\n\n══════════════════════════════\n"
+            + "REFERÊNCIAS BIBLIOGRÁFICAS RELEVANTES (use quando pertinente):\n\n"
+            + contexto_literatura
+            + "\n══════════════════════════════"
+            + _BASE_RAG
+        )
+
     # Escolhe o modelo pelo perfil
     modelo = MODELO_SONNET if req.perfil in PERFIS_SONNET else MODELO_HAIKU
 
-    # Chama o Claude
     try:
         client = anthropic.Anthropic(api_key=API_KEY)
-        # A Anthropic exige que o primeiro item seja sempre "user"
-        # Remove mensagens iniciais do assistente (boas-vindas do frontend)
-        msgs = [{"role": m.role, "content": m.content} for m in req.mensagens]
-        primeiro_user = next((i for i, m in enumerate(msgs) if m["role"] == "user"), None)
-        if primeiro_user is None:
-            raise HTTPException(status_code=400, detail="Nenhuma mensagem do usuário.")
-        msgs = msgs[primeiro_user:]
-
         resposta = client.messages.create(
             model=modelo,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPTS[req.perfil],
+            system=system,
             messages=msgs,
         )
         texto = resposta.content[0].text
@@ -183,5 +299,5 @@ async def chat(req: ChatRequest, request: Request):
 
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e.message))
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
