@@ -38,7 +38,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGENS_PERMITIDAS,
     allow_methods=["POST", "GET"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 # ── Rate limiter em memória ───────────────────────────────────────────────────
