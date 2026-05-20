@@ -15,9 +15,13 @@ from pydantic import BaseModel
 import anthropic
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODELO  = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-MAX_TOKENS = 2000
+API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "")
+MODELO_SONNET  = "claude-sonnet-4-6"
+MODELO_HAIKU   = "claude-haiku-4-5-20251001"
+MAX_TOKENS     = 2000
+
+# Perfis que usam Sonnet (raciocínio clínico profundo)
+PERFIS_SONNET  = {"vet", "farrier"}
 
 # Domínios autorizados a usar o chat (adicione o seu domínio aqui)
 ORIGENS_PERMITIDAS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
@@ -123,11 +127,11 @@ async def test_api():
     try:
         client = anthropic.Anthropic(api_key=API_KEY)
         r = client.messages.create(
-            model=MODELO,
+            model=MODELO_SONNET,
             max_tokens=10,
             messages=[{"role": "user", "content": "Olá"}],
         )
-        return {"ok": True, "modelo": MODELO, "resposta": r.content[0].text}
+        return {"ok": True, "sonnet": MODELO_SONNET, "haiku": MODELO_HAIKU, "resposta": r.content[0].text}
     except Exception as e:
         return {"erro": str(e), "tipo": type(e).__name__, "modelo": MODELO}
 
@@ -147,6 +151,9 @@ async def chat(req: ChatRequest, request: Request):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
 
+    # Escolhe o modelo pelo perfil
+    modelo = MODELO_SONNET if req.perfil in PERFIS_SONNET else MODELO_HAIKU
+
     # Chama o Claude
     try:
         client = anthropic.Anthropic(api_key=API_KEY)
@@ -159,7 +166,7 @@ async def chat(req: ChatRequest, request: Request):
         msgs = msgs[primeiro_user:]
 
         resposta = client.messages.create(
-            model=MODELO,
+            model=modelo,
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPTS[req.perfil],
             messages=msgs,
