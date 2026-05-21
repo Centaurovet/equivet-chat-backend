@@ -21,7 +21,7 @@ API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 API_SECRET     = os.environ.get("API_SECRET", "").strip()   # token obrigatório nos headers do frontend
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
-VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "").strip()   # busca vetorial semântica
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "").strip()   # busca vetorial semântica
 MODELO_SONNET  = "claude-sonnet-4-6"
 MODELO_HAIKU   = "claude-haiku-4-5-20251001"
 MAX_TOKENS     = 2000
@@ -140,12 +140,12 @@ def buscar_literatura(pergunta: str) -> str:
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # ── Modo A: busca vetorial (Voyage AI disponível) ─────────────────────
-        if VOYAGE_API_KEY:
+        # ── Modo A: busca vetorial (Cohere disponível) ────────────────────────
+        if COHERE_API_KEY:
             try:
-                import voyageai
-                vo     = voyageai.Client(api_key=VOYAGE_API_KEY)
-                result = vo.embed([pergunta], model="voyage-multilingual-2", input_type="query")
+                import cohere
+                co     = cohere.Client(api_key=COHERE_API_KEY)
+                result = co.embed(texts=[pergunta], model="embed-multilingual-v3.0", input_type="search_query")
                 query_embedding = result.embeddings[0]
 
                 res = sb.rpc("match_documents", {
