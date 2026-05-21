@@ -16,8 +16,8 @@ from pydantic import BaseModel
 import anthropic
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "")
-API_SECRET     = os.environ.get("API_SECRET", "")   # token obrigatório nos headers do frontend
+API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+API_SECRET     = os.environ.get("API_SECRET", "").strip()   # token obrigatório nos headers do frontend
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
 MODELO_SONNET  = "claude-sonnet-4-6"
@@ -203,6 +203,20 @@ def raiz():
 def health():
     return {"ok": True, "sonnet": MODELO_SONNET, "haiku": MODELO_HAIKU, "rag": bool(SUPABASE_URL)}
 
+@app.get("/debug-auth")
+async def debug_auth(request: Request):
+    """Diagnóstico seguro: compara tamanhos sem expor valores."""
+    token_recebido = request.headers.get("X-API-Key", "").strip()
+    secret_configurado = API_SECRET
+    return {
+        "api_secret_configurado": bool(secret_configurado),
+        "api_secret_len": len(secret_configurado),
+        "token_recebido_len": len(token_recebido),
+        "tokens_iguais": token_recebido == secret_configurado,
+        "token_primeiros_4": token_recebido[:4] if token_recebido else "(vazio)",
+        "secret_primeiros_4": secret_configurado[:4] if secret_configurado else "(vazio)",
+    }
+
 @app.get("/test-api")
 async def test_api():
     """Diagnóstico: testa conexão com Anthropic e Supabase."""
@@ -238,7 +252,7 @@ async def test_api():
 async def chat(req: ChatRequest, request: Request):
     # Verifica token secreto
     if API_SECRET:
-        token = request.headers.get("X-API-Key", "")
+        token = request.headers.get("X-API-Key", "").strip()
         if token != API_SECRET:
             raise HTTPException(status_code=401, detail="Não autorizado.")
 
