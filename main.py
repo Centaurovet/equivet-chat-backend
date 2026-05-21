@@ -21,6 +21,7 @@ API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 API_SECRET     = os.environ.get("API_SECRET", "").strip()   # token obrigatório nos headers do frontend
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
+VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "").strip()   # busca vetorial semântica
 MODELO_SONNET  = "claude-sonnet-4-6"
 MODELO_HAIKU   = "claude-haiku-4-5-20251001"
 MAX_TOKENS     = 2000
@@ -109,35 +110,67 @@ def traduzir_para_busca(pergunta: str) -> str:
     except Exception:
         return ""
 
+def _formatar_chunks(chunks: list) -> str:
+    """Formata lista de chunks para injeção no system prompt."""
+    linhas = []
+    for r in chunks[:RAG_CHUNKS]:
+        ref     = r.get("book", "Referência")
+        cap     = r.get("chapter") or ""
+        pag     = r.get("page_start") or ""
+        ref_str = ref
+        if cap:
+            ref_str += f" — {cap}"
+        if pag:
+            ref_str += f", p.{pag}"
+        linhas.append(f"[{ref_str}]\n{r['text']}")
+    return "\n\n---\n\n".join(linhas)
+
+
 def buscar_literatura(pergunta: str) -> str:
     """
-    Busca chunks relevantes no Supabase por keyword (ilike).
-    Traduz PT→EN/ES antes da busca para encontrar termos nos livros em inglês/espanhol.
+    Busca chunks relevantes no Supabase.
+    Modo A (preferido): busca vetorial semântica via Voyage AI + pgvector.
+    Modo B (fallback):  busca por keyword AND+OR com tradução PT→EN/ES.
     Retorna string formatada para injetar no system prompt, ou "" se vazio.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return ""
+
     try:
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Combina PT + EN + ES para maximizar cobertura de keywords
-        traducoes = traduzir_para_busca(pergunta)
-        texto_busca = pergunta + " " + traducoes if traducoes else pergunta
+        # ── Modo A: busca vetorial (Voyage AI disponível) ─────────────────────
+        if VOYAGE_API_KEY:
+            try:
+                import voyageai
+                vo     = voyageai.Client(api_key=VOYAGE_API_KEY)
+                result = vo.embed([pergunta], model="voyage-multilingual-2", input_type="query")
+                query_embedding = result.embeddings[0]
 
-        keywords = extrair_keywords(texto_busca)
+                res = sb.rpc("match_documents", {
+                    "query_embedding": query_embedding,
+                    "match_count": RAG_CHUNKS,
+                }).execute()
+
+                if res.data:
+                    return _formatar_chunks(res.data)
+            except Exception:
+                pass   # cai no fallback keyword
+
+        # ── Modo B: busca por keyword (fallback) ──────────────────────────────
+        traducoes   = traduzir_para_busca(pergunta)
+        texto_busca = pergunta + " " + traducoes if traducoes else pergunta
+        keywords    = extrair_keywords(texto_busca)
         if not keywords:
             return ""
 
         vistos: set = set()
         chunks: list = []
 
-        # Separa keywords específicos (≥6 chars) dos genéricos
         kws_especificos = [kw for kw in keywords if len(kw) >= 6]
-        kws_todos = keywords
 
-        # ── Fase 1: busca AND com os 2 termos mais específicos ────────────────
-        # Ex: "laminitis" + "radiograph" → só chunks realmente relevantes
+        # Fase 1: AND — exige 2 termos específicos no mesmo chunk
         if len(kws_especificos) >= 2:
             for i in range(len(kws_especificos) - 1):
                 if len(chunks) >= RAG_CHUNKS:
@@ -160,9 +193,9 @@ def buscar_literatura(pergunta: str) -> str:
                 except Exception:
                     continue
 
-        # ── Fase 2: complementa com busca simples se ainda faltam chunks ─────
+        # Fase 2: OR — keyword individual para complementar
         if len(chunks) < RAG_CHUNKS:
-            for kw in kws_todos[:8]:
+            for kw in keywords[:8]:
                 if len(chunks) >= RAG_CHUNKS:
                     break
                 try:
@@ -183,20 +216,7 @@ def buscar_literatura(pergunta: str) -> str:
 
         if not chunks:
             return ""
-
-        linhas = []
-        for r in chunks[:RAG_CHUNKS]:
-            ref = r.get("book", "Referência")
-            cap = r.get("chapter") or ""
-            pag = r.get("page_start") or ""
-            ref_str = f"{ref}"
-            if cap:
-                ref_str += f" — {cap}"
-            if pag:
-                ref_str += f", p.{pag}"
-            linhas.append(f"[{ref_str}]\n{r['text']}")
-
-        return "\n\n---\n\n".join(linhas)
+        return _formatar_chunks(chunks)
 
     except Exception:
         return ""
