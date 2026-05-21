@@ -256,6 +256,54 @@ async def debug_auth(request: Request):
         "secret_primeiros_4": secret_configurado[:4] if secret_configurado else "(vazio)",
     }
 
+@app.get("/debug-rag")
+async def debug_rag(q: str = "laminite crônica achados radiográficos"):
+    """Diagnóstico completo do pipeline RAG para uma query de teste."""
+    resultado: dict = {"query_original": q}
+
+    # 1. Tradução
+    traducao = traduzir_para_busca(q)
+    resultado["traducao"] = traducao or "(falhou ou vazia)"
+    texto_busca = q + " " + traducao if traducao else q
+    resultado["texto_busca_completo"] = texto_busca
+
+    # 2. Keywords extraídos
+    keywords = extrair_keywords(texto_busca)
+    resultado["keywords"] = keywords
+
+    # 3. Busca no Supabase
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        resultado["supabase"] = "não configurado"
+        return resultado
+
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        chunks_por_keyword: dict = {}
+        for kw in keywords[:10]:
+            try:
+                res = (
+                    sb.table("literatura")
+                    .select("chunk_id,book,page_start,text")
+                    .ilike("text", f"%{kw}%")
+                    .limit(2)
+                    .execute()
+                )
+                chunks_por_keyword[kw] = [
+                    {"chunk_id": r["chunk_id"], "book": r["book"],
+                     "page": r.get("page_start"), "preview": r["text"][:80]}
+                    for r in res.data
+                ]
+            except Exception as e:
+                chunks_por_keyword[kw] = f"erro: {e}"
+        resultado["chunks_por_keyword"] = chunks_por_keyword
+        total = sum(len(v) for v in chunks_por_keyword.values() if isinstance(v, list))
+        resultado["total_chunks_encontrados"] = total
+    except Exception as e:
+        resultado["supabase_erro"] = str(e)
+
+    return resultado
+
 @app.get("/test-api")
 async def test_api():
     """Diagnóstico: testa conexão com Anthropic e Supabase."""
