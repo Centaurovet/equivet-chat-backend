@@ -71,37 +71,48 @@ _STOPWORDS = {
     "qual","quais","quando","onde","quem","mais","muito","bem","mas","ou",
 }
 
-def _sem_acentos(texto: str) -> str:
-    """Remove acentos para matching cross-language (PT→EN/ES)."""
-    return "".join(
-        c for c in unicodedata.normalize("NFD", texto)
-        if unicodedata.category(c) != "Mn"
-    )
-
 def extrair_keywords(texto: str) -> List[str]:
-    """
-    Extrai termos de busca cross-language a partir de texto em português.
-    Estratégia:
-    - Remove acentos: 'laminite' → 'laminite', 'crônica' → 'cronica'
-    - Para palavras ≥8 chars, usa raiz de 7: 'laminite' → 'laminit'
-      Isso permite: ilike '%laminit%' → encontra 'laminitis' (EN) e 'laminite' (PT)
-    """
-    palavras = re.findall(r"[a-záàâãéêíóôõúüçñ]+", texto.lower())
-    filtradas = [_sem_acentos(p) for p in palavras if len(p) >= 4 and p not in _STOPWORDS]
-
+    """Extrai palavras ≥4 letras de texto misto PT/EN/ES, ignorando stopwords."""
+    # Captura todo o alfabeto latino (incluindo acentuados)
+    palavras = re.findall(r"[a-zA-ZÀ-ɏ]+", texto.lower())
     resultado: List[str] = []
     vistos: set = set()
-    for p in filtradas:
-        # Raiz curta para palavras longas (cross-language matching)
-        chave = p[:7] if len(p) >= 8 else p
-        if chave not in vistos:
-            resultado.append(chave)
-            vistos.add(chave)
+    for p in palavras:
+        if len(p) >= 4 and p not in _STOPWORDS and p not in vistos:
+            resultado.append(p)
+            vistos.add(p)
     return resultado
+
+def traduzir_para_busca(pergunta: str) -> str:
+    """
+    Usa Claude Haiku para traduzir a pergunta PT → EN + ES.
+    Retorna as traduções concatenadas ao texto original para ampliar os keywords.
+    Latência típica: ~0.5s. Falha silenciosamente.
+    """
+    if not API_KEY:
+        return ""
+    try:
+        client = anthropic.Anthropic(api_key=API_KEY)
+        r = client.messages.create(
+            model=MODELO_HAIKU,
+            max_tokens=120,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Translate the following equine medicine question to English and Spanish. "
+                    "Return ONLY the two translations on separate lines. No labels, no punctuation changes.\n\n"
+                    f"{pergunta}"
+                )
+            }]
+        )
+        return r.content[0].text.strip()
+    except Exception:
+        return ""
 
 def buscar_literatura(pergunta: str) -> str:
     """
     Busca chunks relevantes no Supabase por keyword (ilike).
+    Traduz PT→EN/ES antes da busca para encontrar termos nos livros em inglês/espanhol.
     Retorna string formatada para injetar no system prompt, ou "" se vazio.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -110,7 +121,11 @@ def buscar_literatura(pergunta: str) -> str:
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        keywords = extrair_keywords(pergunta)
+        # Combina PT + EN + ES para maximizar cobertura de keywords
+        traducoes = traduzir_para_busca(pergunta)
+        texto_busca = pergunta + " " + traducoes if traducoes else pergunta
+
+        keywords = extrair_keywords(texto_busca)
         if not keywords:
             return ""
 
