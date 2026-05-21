@@ -7,6 +7,7 @@ Deploy: Railway / Render / qualquer servidor Python.
 import os
 import re
 import time
+import unicodedata
 from collections import defaultdict
 from typing import List, Optional
 
@@ -70,10 +71,33 @@ _STOPWORDS = {
     "qual","quais","quando","onde","quem","mais","muito","bem","mas","ou",
 }
 
+def _sem_acentos(texto: str) -> str:
+    """Remove acentos para matching cross-language (PT→EN/ES)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(c) != "Mn"
+    )
+
 def extrair_keywords(texto: str) -> List[str]:
-    """Extrai palavras com ≥4 letras, ignorando stopwords."""
+    """
+    Extrai termos de busca cross-language a partir de texto em português.
+    Estratégia:
+    - Remove acentos: 'laminite' → 'laminite', 'crônica' → 'cronica'
+    - Para palavras ≥8 chars, usa raiz de 7: 'laminite' → 'laminit'
+      Isso permite: ilike '%laminit%' → encontra 'laminitis' (EN) e 'laminite' (PT)
+    """
     palavras = re.findall(r"[a-záàâãéêíóôõúüçñ]+", texto.lower())
-    return [p for p in palavras if len(p) >= 4 and p not in _STOPWORDS]
+    filtradas = [_sem_acentos(p) for p in palavras if len(p) >= 4 and p not in _STOPWORDS]
+
+    resultado: List[str] = []
+    vistos: set = set()
+    for p in filtradas:
+        # Raiz curta para palavras longas (cross-language matching)
+        chave = p[:7] if len(p) >= 8 else p
+        if chave not in vistos:
+            resultado.append(chave)
+            vistos.add(chave)
+    return resultado
 
 def buscar_literatura(pergunta: str) -> str:
     """
@@ -94,7 +118,7 @@ def buscar_literatura(pergunta: str) -> str:
         chunks: list = []
 
         # Tenta cada keyword até ter RAG_CHUNKS trechos únicos
-        for kw in keywords[:6]:
+        for kw in keywords[:8]:
             if len(chunks) >= RAG_CHUNKS:
                 break
             try:
