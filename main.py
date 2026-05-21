@@ -132,25 +132,54 @@ def buscar_literatura(pergunta: str) -> str:
         vistos: set = set()
         chunks: list = []
 
-        # Tenta cada keyword até ter RAG_CHUNKS trechos únicos
-        for kw in keywords[:8]:
-            if len(chunks) >= RAG_CHUNKS:
-                break
-            try:
-                res = (
-                    sb.table("literatura")
-                    .select("chunk_id,book,author,chapter,page_start,text")
-                    .ilike("text", f"%{kw}%")
-                    .limit(3)
-                    .execute()
-                )
-                for row in res.data:
-                    cid = row.get("chunk_id") or row["text"][:60]
-                    if cid not in vistos:
-                        vistos.add(cid)
-                        chunks.append(row)
-            except Exception:
-                continue
+        # Separa keywords específicos (≥6 chars) dos genéricos
+        kws_especificos = [kw for kw in keywords if len(kw) >= 6]
+        kws_todos = keywords
+
+        # ── Fase 1: busca AND com os 2 termos mais específicos ────────────────
+        # Ex: "laminitis" + "radiograph" → só chunks realmente relevantes
+        if len(kws_especificos) >= 2:
+            for i in range(len(kws_especificos) - 1):
+                if len(chunks) >= RAG_CHUNKS:
+                    break
+                kw1, kw2 = kws_especificos[i], kws_especificos[i + 1]
+                try:
+                    res = (
+                        sb.table("literatura")
+                        .select("chunk_id,book,author,chapter,page_start,text")
+                        .ilike("text", f"%{kw1}%")
+                        .ilike("text", f"%{kw2}%")
+                        .limit(4)
+                        .execute()
+                    )
+                    for row in res.data:
+                        cid = row.get("chunk_id") or row["text"][:60]
+                        if cid not in vistos:
+                            vistos.add(cid)
+                            chunks.append(row)
+                except Exception:
+                    continue
+
+        # ── Fase 2: complementa com busca simples se ainda faltam chunks ─────
+        if len(chunks) < RAG_CHUNKS:
+            for kw in kws_todos[:8]:
+                if len(chunks) >= RAG_CHUNKS:
+                    break
+                try:
+                    res = (
+                        sb.table("literatura")
+                        .select("chunk_id,book,author,chapter,page_start,text")
+                        .ilike("text", f"%{kw}%")
+                        .limit(2)
+                        .execute()
+                    )
+                    for row in res.data:
+                        cid = row.get("chunk_id") or row["text"][:60]
+                        if cid not in vistos:
+                            vistos.add(cid)
+                            chunks.append(row)
+                except Exception:
+                    continue
 
         if not chunks:
             return ""
