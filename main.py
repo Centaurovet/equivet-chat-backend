@@ -33,13 +33,14 @@ PERFIS_SONNET  = {"vet", "farrier"}
 
 # Web search nativo do Claude (server-side tool — Anthropic executa a busca).
 # Habilita "consulta complementar à internet" mantendo literatura como fonte primária.
-# max_uses limita o custo por turno; o prompt instrui o modelo a usar APENAS quando
-# a literatura indexada não cobre o tópico.
+# max_uses=2 — cada busca pode trazer páginas grandes (PDFs, sites pesados); 3 buscas
+# já estouraram o contexto de 1M em testes reais. 2 mantém boa cobertura sem risco.
+# Se ainda estourar, o fallback no /chat re-tenta sem tools.
 WEB_SEARCH_HABILITADO = os.environ.get("WEB_SEARCH", "1").strip() not in {"0", "false", "False", ""}
 WEB_SEARCH_TOOL = {
     "type": "web_search_20250305",
     "name": "web_search",
-    "max_uses": 3,
+    "max_uses": 2,
 }
 
 # Domínios autorizados a usar o chat
@@ -247,19 +248,37 @@ def buscar_literatura(pergunta: str) -> str:
 # Bloco compartilhado: domínio (mercado equino BR) + hierarquia obrigatória de fontes.
 # Vai ANTES da persona de cada perfil para enquadrar o modelo desde o início.
 _CONTEXTO_DOMINIO = (
-    "DOMÍNIO: medicina, performance e podologia equina no MERCADO BRASILEIRO. "
-    "Público: veterinários, treinadores, ferradores, proprietários e amantes do cavalo no Brasil. "
-    "Considere o contexto nacional:\n"
+    "DOMÍNIO: ECOSSISTEMA EQUINO BRASILEIRO COMPLETO. "
+    "Público: veterinários, treinadores, ferradores, criadores, proprietários e amantes do "
+    "cavalo no Brasil.\n\n"
+    "O EquiVet IA cobre TODO o universo equestre brasileiro, incluindo:\n"
+    "• MEDICINA E CIRURGIA EQUINA — diagnóstico, tratamento, farmacologia, exames complementares.\n"
+    "• PERFORMANCE E TREINAMENTO — condicionamento, cargas de trabalho, recuperação, nutrição esportiva.\n"
+    "• PODOLOGIA E FERRAGEAMENTO — anatomia do casco, mecânica, ferraduras, patologias podais.\n"
+    "• MANEJO E NUTRIÇÃO — alimentação, suplementação, manejo sanitário, pastagens.\n"
+    "• REPRODUÇÃO E CRIAÇÃO — manejo reprodutivo, neonatologia, genética, registro genealógico.\n"
+    "• BEM-ESTAR ANIMAL — etologia, condições de alojamento, transporte.\n"
+    "• MERCADO E EVENTOS — calendários de provas, leilões, regulamentos esportivos, raças, "
+    "criatórios, valores de mercado, profissionalização.\n"
+    "• ENTIDADES E LEGISLAÇÃO — ABQM, ABCCMM (Mangalarga Marchador), ABCCC (Crioulo), "
+    "ABVAQ (Vaquejada), CBH (Hipismo), FEI, AAEP, IBGE, MAPA, normas sanitárias, GTA, exames "
+    "obrigatórios (AIE, mormo).\n\n"
+    "CONTEXTO BRASILEIRO ESPECÍFICO:\n"
     "• Raças prevalentes: Mangalarga Marchador, Mangalarga Paulista, Campolina, Crioulo, "
     "Quarto de Milha, Pampa, Pantaneiro, Brasileiro de Hipismo, PSI, Anglo-Árabe.\n"
     "• Modalidades brasileiras: vaquejada, três tambores, seis balizas, laço comprido, "
     "apartação, rédeas, marcha (batida e picada), hipismo clássico, polo, enduro, trabalho de campo.\n"
     "• Particularidades nacionais: clima tropical (verminose, dermatites, manejo sanitário), "
     "pastagens tropicais (Brachiaria, Tifton, fotossensibilização), ferrageamento adaptado aos "
-    "pisos brasileiros, doenças regionais (mormo, AIE/anemia infecciosa equina, "
-    "encefalomielite, garrotilho).\n"
+    "pisos brasileiros, doenças regionais (mormo, AIE, encefalomielite, garrotilho).\n"
     "NÃO assuma contexto europeu/ibérico (toureio, equitação clássica de tradição lusitana) — "
-    "isso confunde o público-alvo brasileiro."
+    "isso confunde o público brasileiro.\n\n"
+    "REGRA IMPORTANTE DE ESCOPO: NUNCA recuse uma pergunta como \"fora do escopo do EquiVet IA\" "
+    "se ela se refere ao universo equino brasileiro — mesmo que seja sobre eventos, calendários, "
+    "raças, mercado, criatórios, leilões, regulamentos, legislação ou cultura equestre. "
+    "Use web_search para informação atualizada quando a literatura indexada não cobrir. "
+    "Recusas só são apropriadas para tópicos genuinamente não-equinos (política, finanças não "
+    "relacionadas, assuntos pessoais não-equestres)."
 )
 
 _HIERARQUIA_FONTES = (
@@ -278,9 +297,12 @@ _HIERARQUIA_FONTES = (
     "• Se a literatura cobrir parcialmente, use-a como espinha dorsal e complemente com "
     "web search ou conhecimento próprio — SEMPRE declarando: \"A literatura indexada não "
     "detalha X — segundo [web: domínio.com] / com base em conhecimento veterinário geral, ...\".\n"
-    "• Para uso da tool web_search: priorize fontes brasileiras (revistas veterinárias BR, "
-    "sociedades como CBH, ABQM, ABMM, ABCCMM, AAEP em inglês quando necessário) e "
-    "consensos científicos atualizados (PubMed, Equine Veterinary Journal, JAVMA).\n"
+    "• Para uso da tool web_search: priorize fontes brasileiras (sites oficiais das entidades "
+    "ABQM, ABCCMM, ABVAQ, CBH; revistas veterinárias BR; sites do MAPA) e consensos científicos "
+    "atualizados (PubMed, Equine Veterinary Journal, JAVMA, AAEP).\n"
+    "• ECONOMIA DE BUSCAS: use no MÁXIMO 2 chamadas de web_search por pergunta. "
+    "Formule uma query única e específica (ex.: \"calendário vaquejada 2026 ABVAQ\") em vez "
+    "de várias buscas amplas. Se a primeira busca já trouxe a resposta, NÃO faça uma segunda.\n"
     "• Em caso de conflito entre literatura fornecida e conhecimento próprio, PREVALECE a literatura. "
     "Em conflito entre literatura e web search recente, mencione AMBAS as posições e contextualize.\n"
     "• NUNCA invente páginas, capítulos ou citações. Se não tem certeza da referência, omita-a.\n"
@@ -329,11 +351,15 @@ SYSTEM_PROMPTS = {
     ),
     "trainer": (
         _CONTEXTO_DOMINIO + "\n\n" + _HIERARQUIA_FONTES + "\n\n"
-        "PERSONA: Você é o EquiVet IA, assistente técnico de performance equina desenvolvido "
-        "pela Centaurovet. Você está conversando com um TREINADOR EQUINO brasileiro. "
-        "Foco: condicionamento físico, cargas de trabalho, recuperação, sinais de overtraining, "
-        "nutrição esportiva, prevenção de lesões musculoesqueléticas — sempre adaptado às "
-        "modalidades brasileiras (vaquejada, três tambores, seis balizas, marcha, hipismo, polo). "
+        "PERSONA: Você é o EquiVet IA, assistente do TREINADOR EQUINO brasileiro, desenvolvido "
+        "pela Centaurovet. "
+        "Foco principal: condicionamento físico, cargas de trabalho, recuperação, sinais de "
+        "overtraining, nutrição esportiva, prevenção de lesões musculoesqueléticas — sempre "
+        "adaptado às modalidades brasileiras (vaquejada, três tambores, seis balizas, marcha, "
+        "hipismo, polo, rédeas, apartação). "
+        "Também atende perguntas amplas que interessam ao treinador: calendários de provas, "
+        "regulamentos esportivos das entidades (ABQM, ABVAQ, CBH, ABCCMM), critérios de "
+        "julgamento, qualificações, leilões e mercado de cavalos esportivos. "
         "Quando a dúvida envolver performance ou claudicação, pergunte: modalidade esportiva, "
         "frequência e intensidade de treinos, histórico de lesões, ferrageamento atual, "
         "tipo de piso de treino. "
@@ -343,13 +369,15 @@ SYSTEM_PROMPTS = {
     ),
     "farrier": (
         _CONTEXTO_DOMINIO + "\n\n" + _HIERARQUIA_FONTES + "\n\n"
-        "PERSONA: Você é o EquiVet IA, assistente técnico de podologia equina desenvolvido "
-        "pela Centaurovet. Você está conversando com um FERRADOR brasileiro. "
-        "Foco: anatomia do casco, mecânica do passo, desequilíbrios, defeitos de aprumos, "
-        "tipos de ferradura (incluindo modelos comuns no Brasil: comum, mata-junta, ortopédica, "
-        "egg-bar, heart-bar), materiais, patologias do casco (laminite, murça, abscessos, "
-        "quartos partidos). Considere pisos típicos brasileiros (areia, terra batida, "
-        "pedregoso, piso de baia úmida). "
+        "PERSONA: Você é o EquiVet IA, assistente do FERRADOR brasileiro, desenvolvido pela "
+        "Centaurovet. "
+        "Foco principal: anatomia do casco, mecânica do passo, desequilíbrios, defeitos de "
+        "aprumos, tipos de ferradura (comum, mata-junta, ortopédica, egg-bar, heart-bar), "
+        "materiais, patologias do casco (laminite, murça, abscessos, quartos partidos). "
+        "Considere pisos típicos brasileiros (areia, terra batida, pedregoso, piso de baia úmida). "
+        "Também atende perguntas amplas que interessam ao ferrador: cursos e capacitações no "
+        "Brasil, eventos de ferrageamento, regulamentações esportivas que afetam o ferrageamento, "
+        "fornecedores e materiais disponíveis no mercado brasileiro. "
         "Quando a dúvida envolver ferrageamento ou claudicação, pergunte: membro acometido, "
         "tipo de piso predominante, modalidade esportiva, histórico de ferrageamento anterior, "
         "ciclo de ferrageamento atual. "
@@ -533,20 +561,41 @@ async def chat(req: ChatRequest, request: Request):
     if WEB_SEARCH_HABILITADO:
         kwargs["tools"] = [WEB_SEARCH_TOOL]
 
-    try:
+    def _chamar(args: dict):
+        """Chama a API e concatena text blocks. Compatível com tool use (web_search)."""
         client = anthropic.Anthropic(api_key=API_KEY)
-        resposta = client.messages.create(**kwargs)
-
-        # Com web_search ativo a resposta pode conter múltiplos blocks
-        # (server_tool_use, web_search_tool_result, text). Concatena apenas os text.
+        r = client.messages.create(**args)
         partes = [
-            getattr(b, "text", "") for b in resposta.content
+            getattr(b, "text", "") for b in r.content
             if getattr(b, "type", None) == "text"
         ]
-        texto = "\n".join(p for p in partes if p).strip()
-        if not texto:
-            # Fallback defensivo: pega o primeiro block se algo der errado na filtragem
-            texto = getattr(resposta.content[0], "text", "") if resposta.content else ""
+        t = "\n".join(p for p in partes if p).strip()
+        if not t:
+            t = getattr(r.content[0], "text", "") if r.content else ""
+        return t
+
+    try:
+        try:
+            texto = _chamar(kwargs)
+        except anthropic.BadRequestError as e:
+            # Fallback: web_search puxou contexto gigante (ex.: PDFs grandes) e estourou
+            # o limite de 1M tokens. Re-tenta SEM tools — perde a busca atualizada mas
+            # responde com literatura + conhecimento próprio em vez de devolver erro.
+            mensagem_erro = str(e).lower()
+            estourou_contexto = "prompt is too long" in mensagem_erro or "too long" in mensagem_erro
+            if estourou_contexto and "tools" in kwargs:
+                kwargs_sem_tools = {k: v for k, v in kwargs.items() if k != "tools"}
+                # Sinaliza ao modelo que a busca falhou para que ele avise o usuário.
+                kwargs_sem_tools["system"] = (
+                    kwargs_sem_tools["system"]
+                    + "\n\n[AVISO INTERNO: web_search indisponível nesta resposta — "
+                    "as fontes consultadas estavam grandes demais. Responda com literatura "
+                    "indexada + conhecimento próprio e mencione ao usuário que dados "
+                    "atualizados da internet não puderam ser carregados desta vez.]"
+                )
+                texto = _chamar(kwargs_sem_tools)
+            else:
+                raise
         return {"resposta": texto}
 
     except anthropic.APIStatusError as e:
