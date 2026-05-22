@@ -25,10 +25,22 @@ COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "").strip()   # busca vetorial
 MODELO_SONNET  = "claude-sonnet-4-6"
 MODELO_HAIKU   = "claude-haiku-4-5-20251001"
 MAX_TOKENS     = 2000
-RAG_CHUNKS     = 4   # número de trechos da literatura a incluir por resposta
+RAG_CHUNKS     = 6   # número de trechos da literatura a incluir por resposta
+RAG_SIM_MIN    = 0.45   # threshold de similaridade (Cohere cosine) — chunks abaixo são descartados
 
 # Perfis que usam Sonnet (raciocínio clínico profundo)
 PERFIS_SONNET  = {"vet", "farrier"}
+
+# Web search nativo do Claude (server-side tool — Anthropic executa a busca).
+# Habilita "consulta complementar à internet" mantendo literatura como fonte primária.
+# max_uses limita o custo por turno; o prompt instrui o modelo a usar APENAS quando
+# a literatura indexada não cobre o tópico.
+WEB_SEARCH_HABILITADO = os.environ.get("WEB_SEARCH", "1").strip() not in {"0", "false", "False", ""}
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": 3,
+}
 
 # Domínios autorizados a usar o chat
 ORIGENS_PERMITIDAS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
@@ -148,13 +160,23 @@ def buscar_literatura(pergunta: str) -> str:
                 result = co.embed(texts=[pergunta], model="embed-multilingual-v3.0", input_type="search_query")
                 query_embedding = result.embeddings[0]
 
+                # Pede mais que o necessário para filtrar por similaridade depois.
                 res = sb.rpc("match_documents", {
                     "query_embedding": query_embedding,
-                    "match_count": RAG_CHUNKS,
+                    "match_count": RAG_CHUNKS * 2,
                 }).execute()
 
                 if res.data:
-                    return _formatar_chunks(res.data)
+                    # Filtra chunks com similaridade abaixo do threshold —
+                    # evita injetar trechos irrelevantes que confundem o modelo.
+                    relevantes = [
+                        r for r in res.data
+                        if (r.get("similarity") or 0) >= RAG_SIM_MIN
+                    ][:RAG_CHUNKS]
+                    if relevantes:
+                        return _formatar_chunks(relevantes)
+                    # Se nenhum passa do threshold, cai para o fallback keyword
+                    # (pode pegar algo útil por correspondência literal).
             except Exception:
                 pass   # cai no fallback keyword
 
@@ -222,52 +244,115 @@ def buscar_literatura(pergunta: str) -> str:
         return ""
 
 # ── System prompts ────────────────────────────────────────────────────────────
+# Bloco compartilhado: domínio (mercado equino BR) + hierarquia obrigatória de fontes.
+# Vai ANTES da persona de cada perfil para enquadrar o modelo desde o início.
+_CONTEXTO_DOMINIO = (
+    "DOMÍNIO: medicina, performance e podologia equina no MERCADO BRASILEIRO. "
+    "Público: veterinários, treinadores, ferradores, proprietários e amantes do cavalo no Brasil. "
+    "Considere o contexto nacional:\n"
+    "• Raças prevalentes: Mangalarga Marchador, Mangalarga Paulista, Campolina, Crioulo, "
+    "Quarto de Milha, Pampa, Pantaneiro, Brasileiro de Hipismo, PSI, Anglo-Árabe.\n"
+    "• Modalidades brasileiras: vaquejada, três tambores, seis balizas, laço comprido, "
+    "apartação, rédeas, marcha (batida e picada), hipismo clássico, polo, enduro, trabalho de campo.\n"
+    "• Particularidades nacionais: clima tropical (verminose, dermatites, manejo sanitário), "
+    "pastagens tropicais (Brachiaria, Tifton, fotossensibilização), ferrageamento adaptado aos "
+    "pisos brasileiros, doenças regionais (mormo, AIE/anemia infecciosa equina, "
+    "encefalomielite, garrotilho).\n"
+    "NÃO assuma contexto europeu/ibérico (toureio, equitação clássica de tradição lusitana) — "
+    "isso confunde o público-alvo brasileiro."
+)
+
+_HIERARQUIA_FONTES = (
+    "HIERARQUIA OBRIGATÓRIA DE FONTES (do mais para o menos autoritativo):\n"
+    "1. LITERATURA FORNECIDA no bloco REFERÊNCIAS BIBLIOGRÁFICAS abaixo (Smith Large Animal "
+    "Surgery, Adams Claudicación en el Caballo). Esta é a fonte PRIMÁRIA e AUTORITATIVA.\n"
+    "2. WEB SEARCH (tool web_search disponível) — para consensos clínicos recentes, dados "
+    "de mercado, epidemiologia regional brasileira e atualizações pós-publicação dos livros. "
+    "Acione APENAS quando a literatura indexada não cobrir o tópico ou estiver desatualizada.\n"
+    "3. CONHECIMENTO PRÓPRIO do modelo — APENAS quando 1 e 2 não cobrirem o tópico. "
+    "Declare explicitamente.\n\n"
+    "REGRAS DE USO:\n"
+    "• Quando a literatura fornecida cobrir a pergunta, BASEIE-SE NELA e cite OBRIGATORIAMENTE "
+    "no formato [Smith Large Animal Surgery, p.X] ou [Adams Claudicación, p.X] no fim do "
+    "parágrafo ou frase correspondente.\n"
+    "• Se a literatura cobrir parcialmente, use-a como espinha dorsal e complemente com "
+    "web search ou conhecimento próprio — SEMPRE declarando: \"A literatura indexada não "
+    "detalha X — segundo [web: domínio.com] / com base em conhecimento veterinário geral, ...\".\n"
+    "• Para uso da tool web_search: priorize fontes brasileiras (revistas veterinárias BR, "
+    "sociedades como CBH, ABQM, ABMM, ABCCMM, AAEP em inglês quando necessário) e "
+    "consensos científicos atualizados (PubMed, Equine Veterinary Journal, JAVMA).\n"
+    "• Em caso de conflito entre literatura fornecida e conhecimento próprio, PREVALECE a literatura. "
+    "Em conflito entre literatura e web search recente, mencione AMBAS as posições e contextualize.\n"
+    "• NUNCA invente páginas, capítulos ou citações. Se não tem certeza da referência, omita-a.\n"
+    "• Se nenhum trecho relevante foi fornecido E o tópico é estritamente veterinário/clínico, "
+    "use web_search OU diga: \"A base de literatura indexada (Smith/Adams) não cobre este "
+    "tópico especificamente.\" antes de responder."
+)
+
 _BASE_RAG = (
-    "\n\nQuando relevante, cite as referências bibliográficas fornecidas acima "
-    "indicando o livro e a página. Se os trechos não forem pertinentes à pergunta, ignore-os."
+    "\n\nAplique a HIERARQUIA OBRIGATÓRIA DE FONTES descrita acima. "
+    "Os trechos abaixo são a fonte PRIMÁRIA — baseie-se neles e cite [Livro, p.X]. "
+    "Se algum trecho não for pertinente à pergunta específica, ignore APENAS ele "
+    "(não a literatura como um todo)."
 )
 
 SYSTEM_PROMPTS = {
     "vet": (
-        "Você é o EquiVet IA, assistente clínico de medicina equina desenvolvido pela Centaurovet. "
-        "Você está conversando com um MÉDICO-VETERINÁRIO EQUINO. Use linguagem técnica precisa: "
-        "termos latinos, nomenclatura farmacológica, protocolos clínicos, doses, vias de administração. "
-        "Seja direto e denso como um colega consultando outro. Sem condescendência. "
-        "Quando a dúvida envolver diagnóstico ou tratamento, pergunte: espécie/raça, idade, peso estimado, "
-        "sinais clínicos específicos, achados de exame físico relevantes. "
+        _CONTEXTO_DOMINIO + "\n\n" + _HIERARQUIA_FONTES + "\n\n"
+        "PERSONA: Você é o EquiVet IA, assistente clínico de medicina equina desenvolvido "
+        "pela Centaurovet. Você está conversando com um MÉDICO-VETERINÁRIO EQUINO brasileiro. "
+        "Use linguagem técnica precisa: termos latinos, nomenclatura farmacológica, protocolos "
+        "clínicos, doses (mg/kg), vias de administração. Seja direto e denso como um colega "
+        "consultando outro. Sem condescendência. "
+        "Quando a dúvida envolver diagnóstico ou tratamento, pergunte: raça, idade, peso "
+        "estimado, sinais clínicos específicos, achados de exame físico relevantes, "
+        "exames complementares já realizados. "
         "Pode discutir diagnósticos diferenciais, indicações cirúrgicas, exames complementares. "
         "Responda em português do Brasil. Seja conciso. "
         "Use bullet points quando listar diagnósticos diferenciais ou protocolos."
     ),
     "owner": (
-        "Você é o EquiVet IA, assistente de saúde equina desenvolvido pela Centaurovet. "
-        "Você está conversando com um PROPRIETÁRIO DE CAVALO. "
-        "Use linguagem clara, acolhedora e precisa — sem ser condescendente, sem jargão desnecessário. "
-        "Quando alguém descrever um problema, pergunte com cuidado: raça, idade, peso aproximado, "
-        "sintomas observados (o que viram, quando começou), se já viu veterinário. "
-        "Sempre que houver risco de emergência (cólica, dificuldade respiratória, trauma), "
-        "sinalize com clareza e oriente a chamar veterinário imediatamente. "
+        _CONTEXTO_DOMINIO + "\n\n" + _HIERARQUIA_FONTES + "\n\n"
+        "PERSONA: Você é o EquiVet IA, assistente de saúde equina desenvolvido pela Centaurovet. "
+        "Você está conversando com um PROPRIETÁRIO DE CAVALO no Brasil. "
+        "Use linguagem clara, acolhedora e precisa — sem ser condescendente, sem jargão "
+        "desnecessário. Cite a literatura nos termos do público leigo (\"segundo o tratado "
+        "Smith, capítulo de cólicas...\") mantendo o formato [Livro, p.X]. "
+        "Quando alguém descrever um problema, pergunte com cuidado: raça, idade, peso "
+        "aproximado, sintomas observados (o que viram, quando começou), se já viu veterinário, "
+        "manejo (estábulo/piquete, alimentação, rotina). "
+        "Sempre que houver risco de emergência (cólica, dificuldade respiratória, trauma, "
+        "claudicação aguda severa), sinalize com clareza e oriente a chamar veterinário "
+        "imediatamente. Nunca substitua atendimento clínico presencial. "
         "Responda em português do Brasil. "
         "Tom: como um veterinário experiente que explica para um amigo que ama o animal."
     ),
     "trainer": (
-        "Você é o EquiVet IA, assistente técnico de performance equina desenvolvido pela Centaurovet. "
-        "Você está conversando com um TREINADOR EQUINO. "
+        _CONTEXTO_DOMINIO + "\n\n" + _HIERARQUIA_FONTES + "\n\n"
+        "PERSONA: Você é o EquiVet IA, assistente técnico de performance equina desenvolvido "
+        "pela Centaurovet. Você está conversando com um TREINADOR EQUINO brasileiro. "
         "Foco: condicionamento físico, cargas de trabalho, recuperação, sinais de overtraining, "
-        "nutrição esportiva, prevenção de lesões musculoesqueléticas. "
+        "nutrição esportiva, prevenção de lesões musculoesqueléticas — sempre adaptado às "
+        "modalidades brasileiras (vaquejada, três tambores, seis balizas, marcha, hipismo, polo). "
         "Quando a dúvida envolver performance ou claudicação, pergunte: modalidade esportiva, "
-        "frequência e intensidade de treinos, histórico de lesões, ferrageamento atual. "
-        "Use linguagem técnica mas acessível. "
+        "frequência e intensidade de treinos, histórico de lesões, ferrageamento atual, "
+        "tipo de piso de treino. "
+        "Use linguagem técnica mas acessível ao treinador (não ao veterinário). "
         "Pode referenciar parâmetros fisiológicos (FC de recuperação, lactato, VO2) quando pertinente. "
         "Responda em português do Brasil. Seja prático e objetivo."
     ),
     "farrier": (
-        "Você é o EquiVet IA, assistente técnico de podologia equina desenvolvido pela Centaurovet. "
-        "Você está conversando com um FERRADOR. "
+        _CONTEXTO_DOMINIO + "\n\n" + _HIERARQUIA_FONTES + "\n\n"
+        "PERSONA: Você é o EquiVet IA, assistente técnico de podologia equina desenvolvido "
+        "pela Centaurovet. Você está conversando com um FERRADOR brasileiro. "
         "Foco: anatomia do casco, mecânica do passo, desequilíbrios, defeitos de aprumos, "
-        "tipos de ferradura, materiais, patologias do casco (laminite, murça, abscessos). "
+        "tipos de ferradura (incluindo modelos comuns no Brasil: comum, mata-junta, ortopédica, "
+        "egg-bar, heart-bar), materiais, patologias do casco (laminite, murça, abscessos, "
+        "quartos partidos). Considere pisos típicos brasileiros (areia, terra batida, "
+        "pedregoso, piso de baia úmida). "
         "Quando a dúvida envolver ferrageamento ou claudicação, pergunte: membro acometido, "
-        "tipo de piso predominante, modalidade esportiva, histórico de ferrageamento anterior. "
+        "tipo de piso predominante, modalidade esportiva, histórico de ferrageamento anterior, "
+        "ciclo de ferrageamento atual. "
         "Respeite o conhecimento prático do ferrador. Seja técnico e colaborativo. "
         "Responda em português do Brasil. Seja direto."
     ),
@@ -436,15 +521,32 @@ async def chat(req: ChatRequest, request: Request):
     # Escolhe o modelo pelo perfil
     modelo = MODELO_SONNET if req.perfil in PERFIS_SONNET else MODELO_HAIKU
 
+    # Monta argumentos da chamada — adiciona web_search como tool quando habilitado.
+    # web_search é um server-side tool: a Anthropic executa a busca automaticamente
+    # e devolve o resultado consolidado em text blocks (não há tool-use loop manual).
+    kwargs = {
+        "model": modelo,
+        "max_tokens": MAX_TOKENS,
+        "system": system,
+        "messages": msgs,
+    }
+    if WEB_SEARCH_HABILITADO:
+        kwargs["tools"] = [WEB_SEARCH_TOOL]
+
     try:
         client = anthropic.Anthropic(api_key=API_KEY)
-        resposta = client.messages.create(
-            model=modelo,
-            max_tokens=MAX_TOKENS,
-            system=system,
-            messages=msgs,
-        )
-        texto = resposta.content[0].text
+        resposta = client.messages.create(**kwargs)
+
+        # Com web_search ativo a resposta pode conter múltiplos blocks
+        # (server_tool_use, web_search_tool_result, text). Concatena apenas os text.
+        partes = [
+            getattr(b, "text", "") for b in resposta.content
+            if getattr(b, "type", None) == "text"
+        ]
+        texto = "\n".join(p for p in partes if p).strip()
+        if not texto:
+            # Fallback defensivo: pega o primeiro block se algo der errado na filtragem
+            texto = getattr(resposta.content[0], "text", "") if resposta.content else ""
         return {"resposta": texto}
 
     except anthropic.APIStatusError as e:
