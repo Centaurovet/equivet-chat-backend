@@ -33,14 +33,39 @@ PERFIS_SONNET  = {"vet", "farrier"}
 
 # Web search nativo do Claude (server-side tool — Anthropic executa a busca).
 # Habilita "consulta complementar à internet" mantendo literatura como fonte primária.
-# max_uses=2 — cada busca pode trazer páginas grandes (PDFs, sites pesados); 3 buscas
-# já estouraram o contexto de 1M em testes reais. 2 mantém boa cobertura sem risco.
-# Se ainda estourar, o fallback no /chat re-tenta sem tools.
+#
+# IMPORTANTE: web_search injeta CADA resultado no contexto da próxima rodada do modelo.
+# Uma única busca em site com PDFs gigantes (ex.: regulamentos de entidades equestres
+# de 200+ páginas) já estoura o limite de 1M tokens. Mitigamos com 2 alavancas:
+# 1. max_uses=1 — uma única busca por pergunta.
+# 2. allowed_domains — restringe a sites institucionais leves (HTML, não PDFs gigantes).
+#
+# Se ainda assim estourar (ou se WEB_SEARCH=0), o fallback no /chat re-tenta sem tools.
 WEB_SEARCH_HABILITADO = os.environ.get("WEB_SEARCH", "1").strip() not in {"0", "false", "False", ""}
 WEB_SEARCH_TOOL = {
     "type": "web_search_20250305",
     "name": "web_search",
-    "max_uses": 2,
+    "max_uses": 1,
+    "allowed_domains": [
+        # Entidades equestres brasileiras (institucionais, HTML leve)
+        "abvaq.com.br",
+        "abqm.com.br",
+        "abccmm.com.br",
+        "abccc.com.br",
+        "cbh.org.br",
+        "anpa.com.br",
+        "abcccampolina.com.br",
+        # Órgãos públicos brasileiros
+        "gov.br",
+        # Veterinária internacional (institucional / consensos clínicos)
+        "aaep.org",
+        "fei.org",
+        # Publicações científicas (snippets curtos, sem PDFs gigantes)
+        "pubmed.ncbi.nlm.nih.gov",
+        "scielo.br",
+        # Referência geral (pode ajudar em raças, eventos, definições)
+        "wikipedia.org",
+    ],
 }
 
 # Domínios autorizados a usar o chat
@@ -577,13 +602,27 @@ async def chat(req: ChatRequest, request: Request):
     try:
         try:
             texto = _chamar(kwargs)
-        except anthropic.BadRequestError as e:
+        except Exception as e:
             # Fallback: web_search puxou contexto gigante (ex.: PDFs grandes) e estourou
             # o limite de 1M tokens. Re-tenta SEM tools — perde a busca atualizada mas
             # responde com literatura + conhecimento próprio em vez de devolver erro.
+            # Logs imprimem nos Deploy Logs do Railway para diagnóstico.
             mensagem_erro = str(e).lower()
-            estourou_contexto = "prompt is too long" in mensagem_erro or "too long" in mensagem_erro
-            if estourou_contexto and "tools" in kwargs:
+            estourou_contexto = (
+                "prompt is too long" in mensagem_erro
+                or "too long" in mensagem_erro
+                or ("context" in mensagem_erro and "limit" in mensagem_erro)
+                or ("maximum" in mensagem_erro and "token" in mensagem_erro)
+            )
+            tem_tools = "tools" in kwargs
+            print(
+                f"[chat] 1a chamada falhou: tipo={type(e).__name__} "
+                f"estourou_contexto={estourou_contexto} tem_tools={tem_tools} "
+                f"msg={str(e)[:300]}"
+            )
+
+            if estourou_contexto and tem_tools:
+                print("[chat] entrando no FALLBACK sem tools")
                 kwargs_sem_tools = {k: v for k, v in kwargs.items() if k != "tools"}
                 # Sinaliza ao modelo que a busca falhou para que ele avise o usuário.
                 kwargs_sem_tools["system"] = (
@@ -593,12 +632,23 @@ async def chat(req: ChatRequest, request: Request):
                     "indexada + conhecimento próprio e mencione ao usuário que dados "
                     "atualizados da internet não puderam ser carregados desta vez.]"
                 )
-                texto = _chamar(kwargs_sem_tools)
+                try:
+                    texto = _chamar(kwargs_sem_tools)
+                    print("[chat] FALLBACK OK — resposta gerada sem tools")
+                except Exception as e2:
+                    print(
+                        f"[chat] FALLBACK TAMBÉM FALHOU: tipo={type(e2).__name__} "
+                        f"msg={str(e2)[:300]}"
+                    )
+                    raise
             else:
+                # Não é erro de contexto OU já não tinha tools — propaga.
                 raise
         return {"resposta": texto}
 
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e.message))
-    except Exception:
+    except Exception as e:
+        # Captura tudo o mais para que erros inesperados apareçam nos logs do Railway.
+        print(f"[chat] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
