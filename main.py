@@ -27,6 +27,8 @@ MODELO_HAIKU   = "claude-haiku-4-5-20251001"
 MAX_TOKENS     = 2000
 RAG_CHUNKS     = 6   # número de trechos da literatura a incluir por resposta
 RAG_SIM_MIN    = 0.45   # threshold de similaridade (Cohere cosine) — chunks abaixo são descartados
+RAG_CHUNK_CHAR_MAX  = 3000     # cap por chunk — protege contra chunks gigantes no Supabase
+RAG_CONTEXT_CHAR_MAX = 40000   # cap total da literatura — ~10K tokens, evita estourar contexto
 
 # Perfis que usam Sonnet (raciocínio clínico profundo)
 PERFIS_SONNET  = {"vet", "farrier"}
@@ -82,7 +84,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGENS_PERMITIDAS,
     allow_methods=["POST", "GET"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
 # ── Rate limiter em memória ───────────────────────────────────────────────────
@@ -98,6 +100,68 @@ def verificar_rate_limit(ip: str):
             detail="Muitas requisições. Aguarde um momento e tente novamente."
         )
     _contadores[ip].append(agora)
+
+# ── Autenticação via JWT do Supabase ──────────────────────────────────────────
+def validar_usuario_supabase(request: Request):
+    """
+    Valida o token de sessão (JWT) enviado pelo EquiVet Clinica no header
+    Authorization: Bearer <access_token>. O token vem do login Supabase do
+    próprio usuário — NÃO é o API_SECRET. Assim o frontend não embute segredo.
+    Retorna o objeto user do Supabase ou levanta 401.
+    """
+    auth = request.headers.get("Authorization", "").strip()
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sessão ausente. Faça login novamente.")
+    token = auth[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Sessão ausente. Faça login novamente.")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase não configurado no servidor.")
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        res = sb.auth.get_user(token)
+        user = getattr(res, "user", None)
+        if not user:
+            raise HTTPException(status_code=401, detail="Sessão inválida ou expirada.")
+        return user
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Sessão inválida ou expirada.")
+
+# ── Chamada ao Claude (reutilizável) ──────────────────────────────────────────
+def _chamar_claude(args: dict) -> str:
+    """Chama a API e concatena text blocks. Compatível com web_search (server-side tool)."""
+    client = anthropic.Anthropic(api_key=API_KEY)
+    r = client.messages.create(**args)
+    partes = [getattr(b, "text", "") for b in r.content if getattr(b, "type", None) == "text"]
+    t = "\n".join(p for p in partes if p).strip()
+    if not t:
+        t = getattr(r.content[0], "text", "") if r.content else ""
+    return t
+
+def _responder_com_websearch(system: str, msgs: list, modelo: str) -> str:
+    """
+    Monta a chamada com web_search (quando habilitado) e faz fallback sem tools
+    caso o contexto estoure o limite de tokens. Usado por /literatura.
+    """
+    kwargs = {"model": modelo, "max_tokens": MAX_TOKENS, "system": system, "messages": msgs}
+    if WEB_SEARCH_HABILITADO:
+        kwargs["tools"] = [WEB_SEARCH_TOOL]
+    try:
+        return _chamar_claude(kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        estourou = (
+            "too long" in msg
+            or ("context" in msg and "limit" in msg)
+            or ("maximum" in msg and "token" in msg)
+        )
+        if estourou and "tools" in kwargs:
+            print("[literatura] fallback sem tools (contexto estourou)")
+            return _chamar_claude({k: v for k, v in kwargs.items() if k != "tools"})
+        raise
 
 # ── RAG: busca de literatura no Supabase ─────────────────────────────────────
 # Stopwords PT/EN/ES a ignorar na extração de keywords
@@ -149,8 +213,17 @@ def traduzir_para_busca(pergunta: str) -> str:
         return ""
 
 def _formatar_chunks(chunks: list) -> str:
-    """Formata lista de chunks para injeção no system prompt."""
+    """
+    Formata lista de chunks para injeção no system prompt.
+    Aplica CAPS DEFENSIVOS — chunks gigantes (capítulos inteiros mal segmentados
+    no Supabase) podem estourar o limite de 1M tokens da API. Truncamos cada
+    chunk individualmente e o conjunto total, registrando nos logs quando algo
+    for cortado para facilitar diagnóstico.
+    """
     linhas = []
+    chunks_truncados = 0
+    tamanho_acumulado = 0
+
     for r in chunks[:RAG_CHUNKS]:
         ref     = r.get("book", "Referência")
         cap     = r.get("chapter") or ""
@@ -160,8 +233,33 @@ def _formatar_chunks(chunks: list) -> str:
             ref_str += f" — {cap}"
         if pag:
             ref_str += f", p.{pag}"
-        linhas.append(f"[{ref_str}]\n{r['text']}")
-    return "\n\n---\n\n".join(linhas)
+
+        texto_original = r.get("text") or ""
+        texto = texto_original
+        if len(texto) > RAG_CHUNK_CHAR_MAX:
+            texto = texto[:RAG_CHUNK_CHAR_MAX] + "\n[…trecho truncado por tamanho…]"
+            chunks_truncados += 1
+
+        linha = f"[{ref_str}]\n{texto}"
+
+        # Cap total — para de adicionar chunks se o contexto já está cheio.
+        if tamanho_acumulado + len(linha) > RAG_CONTEXT_CHAR_MAX:
+            print(
+                f"[rag] cap total ({RAG_CONTEXT_CHAR_MAX} chars) atingido — "
+                f"parando em {len(linhas)} chunks de {len(chunks[:RAG_CHUNKS])} disponíveis"
+            )
+            break
+
+        linhas.append(linha)
+        tamanho_acumulado += len(linha) + 8   # +8 para o separador
+
+    contexto = "\n\n---\n\n".join(linhas)
+    print(
+        f"[rag] contexto formatado: {len(linhas)} chunks, "
+        f"{len(contexto)} chars (~{len(contexto)//4} tokens), "
+        f"chunks_truncados={chunks_truncados}"
+    )
+    return contexto
 
 
 def buscar_literatura(pergunta: str) -> str:
@@ -420,6 +518,10 @@ class ChatRequest(BaseModel):
     perfil: str
     mensagens: List[Mensagem]
 
+class LiteraturaRequest(BaseModel):
+    pergunta: str
+    contexto: Optional[str] = None   # dados do atendimento (queixa, achados) para enriquecer a busca
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def raiz():
@@ -522,6 +624,71 @@ async def test_api():
 
     return resultado
 
+@app.post("/literatura")
+async def literatura(req: LiteraturaRequest, request: Request):
+    """
+    Consulta à literatura veterinária a partir do EquiVet Clinica.
+    Autenticação: JWT do Supabase (usuário logado) — NÃO usa API_SECRET.
+    Reaproveita o pipeline RAG (Cohere + pgvector) e responde com citações [Livro, p.X].
+    """
+    # Autenticação via sessão do usuário logado
+    validar_usuario_supabase(request)
+
+    # Rate limiting por IP
+    verificar_rate_limit(request.client.host)
+
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
+
+    pergunta = (req.pergunta or "").strip()
+    if not pergunta:
+        raise HTTPException(status_code=400, detail="Pergunta vazia.")
+
+    # Enriquece a busca RAG com o contexto do atendimento, se enviado
+    contexto = (req.contexto or "").strip()
+    texto_busca = (contexto + "\n\n" + pergunta).strip() if contexto else pergunta
+
+    contexto_literatura = buscar_literatura(texto_busca)
+
+    # System prompt: usa a persona veterinária (linguagem técnica) + literatura
+    system = SYSTEM_PROMPTS["vet"]
+    if contexto_literatura:
+        system = (
+            system
+            + "\n\n══════════════════════════════\n"
+            + "REFERÊNCIAS BIBLIOGRÁFICAS RELEVANTES (use quando pertinente):\n\n"
+            + contexto_literatura
+            + "\n══════════════════════════════"
+            + _BASE_RAG
+        )
+
+    # Mensagem do usuário: pergunta + contexto do atendimento (se houver)
+    if contexto:
+        conteudo_user = (
+            "CONTEXTO DO ATENDIMENTO (dados já coletados pelo veterinário):\n"
+            + contexto
+            + "\n\nPERGUNTA À LITERATURA:\n"
+            + pergunta
+        )
+    else:
+        conteudo_user = pergunta
+
+    msgs = [{"role": "user", "content": conteudo_user}]
+
+    print(
+        f"[literatura] system={len(system)} chars (~{len(system)//4} tk), "
+        f"lit={'sim' if contexto_literatura else 'nao'}"
+    )
+
+    try:
+        texto = _responder_com_websearch(system, msgs, MODELO_SONNET)
+        return {"resposta": texto, "tem_literatura": bool(contexto_literatura)}
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e.message))
+    except Exception as e:
+        print(f"[literatura] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
+        raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
     # Verifica token secreto
@@ -573,6 +740,17 @@ async def chat(req: ChatRequest, request: Request):
 
     # Escolhe o modelo pelo perfil
     modelo = MODELO_SONNET if req.perfil in PERFIS_SONNET else MODELO_HAIKU
+
+    # Diagnóstico de tamanho — se o system prompt está absurdamente grande,
+    # a chamada vai falhar com 400 prompt too long. Logamos para confirmar.
+    tamanho_system = len(system)
+    tamanho_msgs   = sum(len(m["content"]) for m in msgs)
+    print(
+        f"[chat] perfil={req.perfil} modelo={modelo} "
+        f"system={tamanho_system} chars (~{tamanho_system//4} tokens), "
+        f"msgs={tamanho_msgs} chars (~{tamanho_msgs//4} tokens), "
+        f"lit={'sim' if contexto_literatura else 'nao'}"
+    )
 
     # Monta argumentos da chamada — adiciona web_search como tool quando habilitado.
     # web_search é um server-side tool: a Anthropic executa a busca automaticamente
