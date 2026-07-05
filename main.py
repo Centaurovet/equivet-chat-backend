@@ -681,7 +681,14 @@ async def literatura(req: LiteraturaRequest, request: Request):
     )
 
     try:
-        texto = _responder_com_websearch(system, msgs, MODELO_SONNET)
+        # Sem web_search: a consulta e focada nos livros indexados (Smith/Adams).
+        # Isso reduz drasticamente a latencia e evita que requisicoes longas caiam.
+        texto = _chamar_claude({
+            "model": MODELO_SONNET,
+            "max_tokens": MAX_TOKENS,
+            "system": system,
+            "messages": msgs,
+        })
         return {"resposta": texto, "tem_literatura": bool(contexto_literatura)}
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e.message))
