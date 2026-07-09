@@ -19,8 +19,8 @@ import anthropic
 # ── Configuração ──────────────────────────────────────────────────────────────
 API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 API_SECRET     = os.environ.get("API_SECRET", "").strip()   # token obrigatório nos headers do frontend
-SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_URL   = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "").strip()
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "").strip()   # busca vetorial semântica
 MODELO_SONNET  = "claude-sonnet-4-6"
 MODELO_HAIKU   = "claude-haiku-4-5-20251001"
@@ -29,6 +29,13 @@ RAG_CHUNKS     = 6   # número de trechos da literatura a incluir por resposta
 RAG_SIM_MIN    = 0.45   # threshold de similaridade (Cohere cosine) — chunks abaixo são descartados
 RAG_CHUNK_CHAR_MAX  = 3000     # cap por chunk — protege contra chunks gigantes no Supabase
 RAG_CONTEXT_CHAR_MAX = 40000   # cap total da literatura — ~10K tokens, evita estourar contexto
+
+# Caps de input — protegem contra abuso de custo (inputs gigantes inflam tokens)
+MAX_PERGUNTA_CHARS  = 2000     # /literatura: pergunta
+MAX_CONTEXTO_CHARS  = 8000     # /literatura: contexto do atendimento
+MAX_MSG_CHARS       = 4000     # /chat: cada mensagem individual
+MAX_MSGS_TOTAL_CHARS = 24000   # /chat: soma de todas as mensagens
+MAX_MSGS_COUNT      = 40       # /chat: número de mensagens no histórico
 
 # Perfis que usam Sonnet (raciocínio clínico profundo)
 PERFIS_SONNET  = {"vet", "farrier"}
@@ -90,6 +97,18 @@ app.add_middleware(
 # ── Rate limiter em memória ───────────────────────────────────────────────────
 _contadores: dict = defaultdict(list)
 
+def ip_do_cliente(request: Request) -> str:
+    """
+    Retorna o IP real do cliente atrás do proxy do Railway.
+    request.client.host devolve o IP interno do proxy — todos os usuários
+    cairiam no mesmo bucket de rate limit. O Railway define X-Forwarded-For;
+    usamos o PRIMEIRO IP da lista (o mais próximo do cliente real).
+    """
+    xff = request.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "desconhecido"
+
 def verificar_rate_limit(ip: str):
     agora = time.time()
     janela = agora - RATE_JANELA_SEG
@@ -100,6 +119,10 @@ def verificar_rate_limit(ip: str):
             detail="Muitas requisições. Aguarde um momento e tente novamente."
         )
     _contadores[ip].append(agora)
+    # Higiene de memória: remove buckets vazios para o dict não crescer sem limite
+    if len(_contadores) > 10000:
+        for k in [k for k, v in _contadores.items() if not v or v[-1] <= janela]:
+            del _contadores[k]
 
 # ── Autenticação via JWT do Supabase ──────────────────────────────────────────
 def validar_usuario_supabase(request: Request):
@@ -531,98 +554,11 @@ def raiz():
 def health():
     return {"ok": True, "sonnet": MODELO_SONNET, "haiku": MODELO_HAIKU, "rag": bool(SUPABASE_URL)}
 
-@app.get("/debug-auth")
-async def debug_auth(request: Request):
-    """Diagnóstico seguro: compara tamanhos sem expor valores."""
-    token_recebido = request.headers.get("X-API-Key", "").strip()
-    secret_configurado = API_SECRET
-    return {
-        "api_secret_configurado": bool(secret_configurado),
-        "api_secret_len": len(secret_configurado),
-        "token_recebido_len": len(token_recebido),
-        "tokens_iguais": token_recebido == secret_configurado,
-        "token_primeiros_4": token_recebido[:4] if token_recebido else "(vazio)",
-        "secret_primeiros_4": secret_configurado[:4] if secret_configurado else "(vazio)",
-    }
-
-@app.get("/debug-rag")
-async def debug_rag(q: str = "laminite crônica achados radiográficos"):
-    """Diagnóstico completo do pipeline RAG para uma query de teste."""
-    resultado: dict = {"query_original": q}
-
-    # 1. Tradução
-    traducao = traduzir_para_busca(q)
-    resultado["traducao"] = traducao or "(falhou ou vazia)"
-    texto_busca = q + " " + traducao if traducao else q
-    resultado["texto_busca_completo"] = texto_busca
-
-    # 2. Keywords extraídos
-    keywords = extrair_keywords(texto_busca)
-    resultado["keywords"] = keywords
-
-    # 3. Busca no Supabase
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        resultado["supabase"] = "não configurado"
-        return resultado
-
-    try:
-        from supabase import create_client
-        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        chunks_por_keyword: dict = {}
-        for kw in keywords[:10]:
-            try:
-                res = (
-                    sb.table("literatura")
-                    .select("chunk_id,book,page_start,text")
-                    .ilike("text", f"%{kw}%")
-                    .limit(2)
-                    .execute()
-                )
-                chunks_por_keyword[kw] = [
-                    {"chunk_id": r["chunk_id"], "book": r["book"],
-                     "page": r.get("page_start"), "preview": r["text"][:80]}
-                    for r in res.data
-                ]
-            except Exception as e:
-                chunks_por_keyword[kw] = f"erro: {e}"
-        resultado["chunks_por_keyword"] = chunks_por_keyword
-        total = sum(len(v) for v in chunks_por_keyword.values() if isinstance(v, list))
-        resultado["total_chunks_encontrados"] = total
-    except Exception as e:
-        resultado["supabase_erro"] = str(e)
-
-    return resultado
-
-@app.get("/test-api")
-async def test_api():
-    """Diagnóstico: testa conexão com Anthropic e Supabase."""
-    resultado: dict = {}
-    if not API_KEY:
-        resultado["anthropic"] = "API_KEY não configurada"
-    else:
-        try:
-            client = anthropic.Anthropic(api_key=API_KEY)
-            r = client.messages.create(
-                model=MODELO_SONNET,
-                max_tokens=10,
-                messages=[{"role": "user", "content": "Olá"}],
-            )
-            resultado["anthropic"] = {"ok": True, "resposta": r.content[0].text}
-        except Exception as e:
-            resultado["anthropic"] = {"erro": str(e)}
-
-    if not SUPABASE_URL:
-        resultado["supabase"] = "SUPABASE_URL não configurada"
-    else:
-        try:
-            from supabase import create_client
-            sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-            c = sb.table("literatura").select("chunk_id", count="exact").limit(1).execute()
-            resultado["supabase"] = {"ok": True, "total_chunks": c.count}
-        except Exception as e:
-            resultado["supabase"] = {"erro": str(e)}
-
-    return resultado
+# NOTA DE SEGURANÇA: os endpoints /debug-auth, /debug-rag e /test-api foram
+# REMOVIDOS (jul/2026). Eram acessíveis sem autenticação: /debug-auth funcionava
+# como oráculo do API_SECRET (expunha tamanho, prefixo e confirmava palpites);
+# /debug-rag e /test-api disparavam chamadas pagas (Claude/Cohere) para qualquer
+# visitante anônimo. Para diagnóstico, use os logs do Railway.
 
 @app.post("/literatura")
 async def literatura(req: LiteraturaRequest, request: Request):
@@ -634,8 +570,8 @@ async def literatura(req: LiteraturaRequest, request: Request):
     # Autenticação via sessão do usuário logado
     validar_usuario_supabase(request)
 
-    # Rate limiting por IP
-    verificar_rate_limit(request.client.host)
+    # Rate limiting por IP real (X-Forwarded-For — atrás do proxy Railway)
+    verificar_rate_limit(ip_do_cliente(request))
 
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
@@ -643,9 +579,12 @@ async def literatura(req: LiteraturaRequest, request: Request):
     pergunta = (req.pergunta or "").strip()
     if not pergunta:
         raise HTTPException(status_code=400, detail="Pergunta vazia.")
+    if len(pergunta) > MAX_PERGUNTA_CHARS:
+        raise HTTPException(status_code=413, detail="Pergunta longa demais.")
 
     # Enriquece a busca RAG com o contexto do atendimento, se enviado
-    contexto = (req.contexto or "").strip()
+    # (truncado defensivamente — protege contra abuso de custo por input gigante)
+    contexto = (req.contexto or "").strip()[:MAX_CONTEXTO_CHARS]
     texto_busca = (contexto + "\n\n" + pergunta).strip() if contexto else pergunta
 
     contexto_literatura = buscar_literatura(texto_busca)
@@ -691,7 +630,9 @@ async def literatura(req: LiteraturaRequest, request: Request):
         })
         return {"resposta": texto, "tem_literatura": bool(contexto_literatura)}
     except anthropic.APIStatusError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e.message))
+        # Não repassa a mensagem crua da Anthropic ao cliente (vazamento de infra)
+        print(f"[literatura] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível no momento. Tente novamente.")
     except Exception as e:
         print(f"[literatura] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
@@ -704,9 +645,8 @@ async def chat(req: ChatRequest, request: Request):
         if token != API_SECRET:
             raise HTTPException(status_code=401, detail="Não autorizado.")
 
-    # Rate limiting
-    ip = request.client.host
-    verificar_rate_limit(ip)
+    # Rate limiting por IP real (X-Forwarded-For — atrás do proxy Railway)
+    verificar_rate_limit(ip_do_cliente(request))
 
     # Valida perfil
     if req.perfil not in SYSTEM_PROMPTS:
@@ -714,6 +654,14 @@ async def chat(req: ChatRequest, request: Request):
 
     if not req.mensagens:
         raise HTTPException(status_code=400, detail="Nenhuma mensagem enviada.")
+
+    # Caps de input — protegem contra abuso de custo
+    if len(req.mensagens) > MAX_MSGS_COUNT:
+        raise HTTPException(status_code=413, detail="Histórico longo demais.")
+    if any(len(m.content) > MAX_MSG_CHARS for m in req.mensagens):
+        raise HTTPException(status_code=413, detail="Mensagem longa demais.")
+    if sum(len(m.content) for m in req.mensagens) > MAX_MSGS_TOTAL_CHARS:
+        raise HTTPException(status_code=413, detail="Conversa longa demais. Inicie um novo chat.")
 
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
@@ -832,7 +780,9 @@ async def chat(req: ChatRequest, request: Request):
         return {"resposta": texto}
 
     except anthropic.APIStatusError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e.message))
+        # Não repassa a mensagem crua da Anthropic ao cliente (vazamento de infra)
+        print(f"[chat] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível no momento. Tente novamente.")
     except Exception as e:
         # Captura tudo o mais para que erros inesperados apareçam nos logs do Railway.
         print(f"[chat] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
