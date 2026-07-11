@@ -545,6 +545,16 @@ class LiteraturaRequest(BaseModel):
     pergunta: str
     contexto: Optional[str] = None   # dados do atendimento (queixa, achados) para enriquecer a busca
 
+class AnaliseSangueRequest(BaseModel):
+    # Quadro do exame já montado pelo EquiVet Lab: paciente + valores + alterações.
+    quadro: str
+    # Resumo das alterações (usado como query do RAG). Se ausente, usa o quadro inteiro.
+    alteracoes: Optional[str] = None
+
+class PdfLabRequest(BaseModel):
+    pdf_base64: str          # PDF do laboratório em base64 (sem o prefixo data:)
+    schema_valores: str      # IDs aceitos do formulário, montados no frontend
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def raiz():
@@ -636,6 +646,152 @@ async def literatura(req: LiteraturaRequest, request: Request):
     except Exception as e:
         print(f"[literatura] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
+@app.post("/analisar-sangue")
+async def analisar_sangue(req: AnaliseSangueRequest, request: Request):
+    """
+    Interpretação de hemograma/bioquímico equino a partir do EquiVet Lab.
+    Autenticação: JWT do Supabase (usuário logado) — mesmo padrão do /literatura.
+    A busca RAG é montada a partir das ALTERAÇÕES do exame → ancora o laudo na
+    literatura Smith/Adams em vez dos priors genéricos do modelo. Sem web_search.
+    """
+    validar_usuario_supabase(request)
+    verificar_rate_limit(ip_do_cliente(request))
+
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
+
+    quadro = (req.quadro or "").strip()[:MAX_CONTEXTO_CHARS]
+    if not quadro:
+        raise HTTPException(status_code=400, detail="Quadro do exame vazio.")
+
+    # Query do RAG: prioriza as alterações (mais específicas); senão usa o quadro todo.
+    query_rag = (req.alteracoes or "").strip()[:MAX_PERGUNTA_CHARS] or quadro
+    contexto_literatura = buscar_literatura(query_rag)
+
+    system = SYSTEM_PROMPTS["vet"]
+    if contexto_literatura:
+        system = (
+            system
+            + "\n\n══════════════════════════════\n"
+            + "REFERÊNCIAS BIBLIOGRÁFICAS RELEVANTES (fundamente o laudo nelas quando pertinente):\n\n"
+            + contexto_literatura
+            + "\n══════════════════════════════"
+            + _BASE_RAG
+        )
+
+    conteudo_user = (
+        "Você recebeu o quadro laboratorial completo de um equino (hemograma e/ou "
+        "bioquímico) já validado contra faixas de referência. Elabore um laudo clínico "
+        "estruturado em português, em markdown, com as seções: ## Síntese do quadro / "
+        "## Hipóteses diagnósticas / ## Diferenciais a considerar / ## Exames complementares / "
+        "## Conduta sugerida. Fundamente nas referências bibliográficas fornecidas quando "
+        "aplicável, citando [Livro, p.X]. NÃO invente valores não fornecidos.\n\n"
+        "QUADRO LABORATORIAL:\n" + quadro
+    )
+    msgs = [{"role": "user", "content": conteudo_user}]
+
+    print(
+        f"[analisar-sangue] system={len(system)} chars (~{len(system)//4} tk), "
+        f"lit={'sim' if contexto_literatura else 'nao'}"
+    )
+
+    try:
+        texto = _chamar_claude({
+            "model": MODELO_SONNET,
+            "max_tokens": MAX_TOKENS,
+            "system": system,
+            "messages": msgs,
+        })
+        return {"laudo": texto, "tem_literatura": bool(contexto_literatura)}
+    except anthropic.APIStatusError as e:
+        print(f"[analisar-sangue] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível no momento. Tente novamente.")
+    except Exception as e:
+        print(f"[analisar-sangue] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
+        raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
+
+@app.post("/importar-pdf-lab")
+async def importar_pdf_lab(req: PdfLabRequest, request: Request):
+    """
+    Extração de valores + identificação do paciente a partir do PDF do laboratório.
+    Autenticação: JWT do Supabase. Retorna JSON estruturado (paciente/valores/
+    interpretacao_clinica/observacoes_extracao). O laudo fundamentado na literatura
+    é obtido depois via /analisar-sangue (os valores só existem após ler o PDF).
+    """
+    validar_usuario_supabase(request)
+    verificar_rate_limit(ip_do_cliente(request))
+
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
+
+    pdf_b64 = (req.pdf_base64 or "").strip()
+    if not pdf_b64:
+        raise HTTPException(status_code=400, detail="PDF ausente.")
+    # ~33% de overhead do base64; cap defensivo de custo (~7 MB de PDF).
+    if len(pdf_b64) > 10_000_000:
+        raise HTTPException(status_code=413, detail="PDF grande demais (máx. ~7 MB).")
+    schema = (req.schema_valores or "").strip()[:8000]
+
+    prompt_extracao = (
+        "Você é um especialista em laboratório veterinário equino. Recebeu o PDF de um "
+        "resultado de exame de sangue (hemograma e/ou bioquímico) de um cavalo.\n\n"
+        "## TAREFA\n"
+        "1. Extraia TODOS os valores numéricos que reconhecer\n"
+        "2. Identifique a identificação do paciente (nome, raça, idade, sexo, peso, "
+        "proprietário, data da coleta, histórico)\n"
+        "3. Faça uma interpretação clínica preliminar\n\n"
+        "## FORMATO DE RESPOSTA\n"
+        "Retorne EXCLUSIVAMENTE um JSON válido (sem markdown, sem crase, sem texto antes "
+        "ou depois) no formato:\n\n"
+        "{\n"
+        '  "paciente": {\n'
+        '    "nome": "string ou null", "raca": "string ou null",\n'
+        '    "idade": "número ou null (anos)",\n'
+        '    "sexo": "Macho inteiro | Castrado | Fêmea | Égua prenhe | Égua lactante | null",\n'
+        '    "peso": "número ou null (kg)", "proprietario": "string ou null",\n'
+        '    "data": "YYYY-MM-DD ou null", "historico": "string ou null"\n'
+        "  },\n"
+        '  "valores": {\n'
+        "    // IDs aceitos abaixo. Inclua APENAS os que encontrou. Valor numérico, ponto decimal.\n"
+        f"{schema}\n"
+        "  },\n"
+        '  "interpretacao_clinica": "string markdown — laudo em português: ## Síntese do quadro / '
+        "## Hipóteses diagnósticas / ## Diferenciais a considerar / ## Exames complementares / "
+        '## Conduta sugerida. Cite Smith Large Animal Surgery / Adams Lameness / AAEP quando aplicável.",\n'
+        '  "observacoes_extracao": "string — ressalvas sobre valores incertos ou fora do schema"\n'
+        "}\n\n"
+        "IMPORTANTE: se um parâmetro tem nome diferente no PDF (ex.: \"Hb\" para hemoglobina, "
+        "\"TGO\" para AST), use o ID correto do schema. Se não encontrar um valor, NÃO inclua a chave."
+    )
+
+    args = {
+        "model": MODELO_SONNET,
+        "max_tokens": 4096,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": pdf_b64,
+                }},
+                {"type": "text", "text": prompt_extracao},
+            ],
+        }],
+    }
+
+    print(f"[importar-pdf-lab] pdf={len(pdf_b64)} b64chars, schema={len(schema)} chars")
+
+    try:
+        texto = _chamar_claude(args)
+        return {"raw": texto}   # frontend faz o parse tolerante do JSON (igual ao fluxo antigo)
+    except anthropic.APIStatusError as e:
+        print(f"[importar-pdf-lab] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível no momento. Tente novamente.")
+    except Exception as e:
+        print(f"[importar-pdf-lab] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
+        raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
 
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request):
