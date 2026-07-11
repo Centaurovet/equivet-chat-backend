@@ -77,8 +77,20 @@ WEB_SEARCH_TOOL = {
     ],
 }
 
-# Domínios autorizados a usar o chat
-ORIGENS_PERMITIDAS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+# Domínios autorizados a usar o chat.
+# Combina a env var (ALLOWED_ORIGINS) com a família de domínios do EquiVet,
+# garantindo que o CORS funcione mesmo se a variável faltar/estiver incompleta
+# no Railway (causa clássica de preflight OPTIONS → 404 e "Failed to fetch").
+_ORIGENS_ENV = os.environ.get("ALLOWED_ORIGINS", "").strip()
+ORIGENS_PERMITIDAS = [o.strip() for o in _ORIGENS_ENV.split(",") if o.strip()]
+_ORIGENS_PADRAO = [
+    "https://centaurovet.com.br",
+    "https://www.centaurovet.com.br",
+    "https://centaurovet.github.io",
+]
+for _o in _ORIGENS_PADRAO:
+    if _o not in ORIGENS_PERMITIDAS:
+        ORIGENS_PERMITIDAS.append(_o)
 
 # Rate limiting simples: máx. requisições por janela de tempo por IP
 RATE_LIMITE      = int(os.environ.get("RATE_LIMIT", "15"))
@@ -90,7 +102,7 @@ app = FastAPI(title="EquiVet IA Chat API", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGENS_PERMITIDAS,
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
