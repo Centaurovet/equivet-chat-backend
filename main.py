@@ -37,6 +37,11 @@ MAX_MSG_CHARS       = 4000     # /chat: cada mensagem individual
 MAX_MSGS_TOTAL_CHARS = 24000   # /chat: soma de todas as mensagens
 MAX_MSGS_COUNT      = 40       # /chat: número de mensagens no histórico
 
+# Limite de consultas de IA para o plano free (premium = ilimitado).
+# Pool compartilhado entre /literatura, /analisar-sangue e /importar-pdf-lab.
+LIMITE_IA_FREE   = int(os.environ.get("LIMITE_IA_FREE", "3"))
+JANELA_IA_HORAS  = int(os.environ.get("JANELA_IA_HORAS", "48"))
+
 # Perfis que usam Sonnet (raciocínio clínico profundo)
 PERFIS_SONNET  = {"vet", "farrier"}
 
@@ -164,6 +169,61 @@ def validar_usuario_supabase(request: Request):
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Sessão inválida ou expirada.")
+
+# ── Limite de consultas de IA (free 3/48h · premium ilimitado) ────────────────
+def verificar_limite_ia(user):
+    """
+    Checa o limite ANTES de chamar o Claude. Premium → libera. Free → conta as
+    consultas bem-sucedidas na janela e levanta 429 se já atingiu LIMITE_IA_FREE.
+    Fail-open: erro de infra (Supabase indisponível) NÃO bloqueia o usuário.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    uid = getattr(user, "id", None)
+    if not uid:
+        return
+    try:
+        from datetime import datetime, timedelta, timezone
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        prof = sb.table("profiles").select("premium").eq("id", uid).limit(1).execute()
+        if prof.data and prof.data[0].get("premium"):
+            return  # premium → ilimitado
+
+        limite_ts = (datetime.now(timezone.utc) - timedelta(hours=JANELA_IA_HORAS)).isoformat()
+        usados = (sb.table("consumo_ia")
+                    .select("id", count="exact")
+                    .eq("user_id", uid)
+                    .gte("criado_em", limite_ts)
+                    .execute())
+        n = usados.count or 0
+        if n >= LIMITE_IA_FREE:
+            raise HTTPException(
+                status_code=429,
+                detail=(f"Você atingiu o limite de {LIMITE_IA_FREE} consultas de IA a cada "
+                        f"{JANELA_IA_HORAS}h do plano gratuito. Assine o plano Premium para "
+                        f"consultas ilimitadas."),
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[limite-ia] verificar falhou (fail-open): {type(e).__name__} {str(e)[:200]}")
+        return
+
+def registrar_consumo_ia(user, endpoint: str):
+    """Registra UMA consulta bem-sucedida. Chamado só após a resposta do Claude."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    uid = getattr(user, "id", None)
+    if not uid:
+        return
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        sb.table("consumo_ia").insert({"user_id": uid, "endpoint": endpoint}).execute()
+    except Exception as e:
+        print(f"[limite-ia] registrar falhou: {type(e).__name__} {str(e)[:200]}")
 
 # ── Chamada ao Claude (reutilizável) ──────────────────────────────────────────
 def _chamar_claude(args: dict) -> str:
@@ -590,10 +650,13 @@ async def literatura(req: LiteraturaRequest, request: Request):
     Reaproveita o pipeline RAG (Cohere + pgvector) e responde com citações [Livro, p.X].
     """
     # Autenticação via sessão do usuário logado
-    validar_usuario_supabase(request)
+    user = validar_usuario_supabase(request)
 
     # Rate limiting por IP real (X-Forwarded-For — atrás do proxy Railway)
     verificar_rate_limit(ip_do_cliente(request))
+
+    # Limite de consultas de IA do plano (free 3/48h · premium ilimitado)
+    verificar_limite_ia(user)
 
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
@@ -650,6 +713,7 @@ async def literatura(req: LiteraturaRequest, request: Request):
             "system": system,
             "messages": msgs,
         })
+        registrar_consumo_ia(user, "literatura")
         return {"resposta": texto, "tem_literatura": bool(contexto_literatura)}
     except anthropic.APIStatusError as e:
         # Não repassa a mensagem crua da Anthropic ao cliente (vazamento de infra)
@@ -667,8 +731,9 @@ async def analisar_sangue(req: AnaliseSangueRequest, request: Request):
     A busca RAG é montada a partir das ALTERAÇÕES do exame → ancora o laudo na
     literatura Smith/Adams em vez dos priors genéricos do modelo. Sem web_search.
     """
-    validar_usuario_supabase(request)
+    user = validar_usuario_supabase(request)
     verificar_rate_limit(ip_do_cliente(request))
+    verificar_limite_ia(user)
 
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
@@ -715,6 +780,7 @@ async def analisar_sangue(req: AnaliseSangueRequest, request: Request):
             "system": system,
             "messages": msgs,
         })
+        registrar_consumo_ia(user, "analisar-sangue")
         return {"laudo": texto, "tem_literatura": bool(contexto_literatura)}
     except anthropic.APIStatusError as e:
         print(f"[analisar-sangue] APIStatusError {e.status_code}: {str(e.message)[:300]}")
@@ -732,8 +798,9 @@ async def importar_pdf_lab(req: PdfLabRequest, request: Request):
     interpretacao_clinica/observacoes_extracao). O laudo fundamentado na literatura
     é obtido depois via /analisar-sangue (os valores só existem após ler o PDF).
     """
-    validar_usuario_supabase(request)
+    user = validar_usuario_supabase(request)
     verificar_rate_limit(ip_do_cliente(request))
+    verificar_limite_ia(user)
 
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
@@ -796,6 +863,7 @@ async def importar_pdf_lab(req: PdfLabRequest, request: Request):
 
     try:
         texto = _chamar_claude(args)
+        registrar_consumo_ia(user, "importar-pdf-lab")
         return {"raw": texto}   # frontend faz o parse tolerante do JSON (igual ao fluxo antigo)
     except anthropic.APIStatusError as e:
         print(f"[importar-pdf-lab] APIStatusError {e.status_code}: {str(e.message)[:300]}")
