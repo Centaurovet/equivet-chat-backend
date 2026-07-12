@@ -634,8 +634,9 @@ class InsallRequest(BaseModel):
 class InsallQuizRequest(BaseModel):
     formato: str                       # "multipla" | "dissertativa" | "flashcard" | "caso"
     n: int = 5                         # número de questões (5/10/15)
-    capitulo_num: Optional[int] = None  # número do capítulo (escopo por capítulo)
-    tema: Optional[str] = None          # tema livre (escopo por busca semântica)
+    capitulos: Optional[List[int]] = None  # um ou mais capítulos (escopo por capítulo)
+    capitulo_num: Optional[int] = None     # compat: capítulo único
+    tema: Optional[str] = None             # tema livre (escopo por busca semântica)
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -862,60 +863,86 @@ async def insall(req: InsallRequest, request: Request):
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
 
 # ── Insall — modo Estudar (geração de questões) ──────────────────────────────
-def _chunks_do_capitulo(cap_num: int) -> str:
-    """Puxa trechos de um capítulo específico e monta um contexto amostrado."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
+def _chunks_de_capitulos(nums: list) -> str:
+    """Puxa trechos de um ou mais capítulos e monta um contexto amostrado,
+    dividindo o orçamento de contexto igualmente entre os capítulos."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not nums:
         return ""
     try:
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        res = (sb.table("insall")
-               .select("capitulo,pagina,pdf_page,texto")
-               .ilike("capitulo", f"Cap. {cap_num} —%")
-               .limit(400).execute())
-        rows = res.data or []
-        if not rows:
-            return ""
-        # amostra uniforme ao longo do capítulo para caber no contexto
-        alvo = 28000
-        passo = max(1, len(rows) // 40)
-        amostra = rows[::passo]
-        linhas, acc = [], 0
-        for r in amostra:
-            pag = r.get("pagina") or (f"PDF {r.get('pdf_page')}" if r.get("pdf_page") else "")
-            texto = (r.get("texto") or "")[:1600]
-            linha = f"[p.{pag}] {texto}"
-            if acc + len(linha) > alvo:
-                break
-            linhas.append(linha); acc += len(linha)
-        return "\n\n".join(linhas)
+        alvo_total = 30000
+        por_cap = max(4000, alvo_total // len(nums))
+        blocos = []
+        for cap_num in nums:
+            res = (sb.table("insall")
+                   .select("capitulo,pagina,pdf_page,texto")
+                   .ilike("capitulo", f"Cap. {int(cap_num)} —%")
+                   .limit(400).execute())
+            rows = res.data or []
+            if not rows:
+                continue
+            passo = max(1, len(rows) // 30)
+            amostra = rows[::passo]
+            linhas, acc = [], 0
+            for r in amostra:
+                pag = r.get("pagina") or (f"PDF {r.get('pdf_page')}" if r.get("pdf_page") else "")
+                texto = (r.get("texto") or "")[:1400]
+                linha = f"[cap.{cap_num}, p.{pag}] {texto}"
+                if acc + len(linha) > por_cap:
+                    break
+                linhas.append(linha); acc += len(linha)
+            if linhas:
+                blocos.append("\n\n".join(linhas))
+        return "\n\n".join(blocos)
     except Exception as e:
-        print(f"[insall-quiz] capítulo falhou: {type(e).__name__} {str(e)[:200]}")
+        print(f"[insall-quiz] capítulos falhou: {type(e).__name__} {str(e)[:200]}")
         return ""
 
-_QUIZ_FORMATOS = {
+# Instruções de SCHEMA JSON por formato — a saída é consumida pela tela interativa.
+_QUIZ_SCHEMA = {
     "multipla": (
-        "Gere questões de MÚLTIPLA ESCOLHA no estilo de prova de título/residência de ortopedia. "
-        "Para cada questão: enunciado claro, 4 alternativas (A–D) plausíveis, indique a CORRETA e "
-        "explique por que em 1–2 frases, citando a página [p.X]."
+        'Formato MÚLTIPLA ESCOLHA (estilo prova de título/residência). Retorne um ARRAY JSON. '
+        'Cada item: {"q": "enunciado", "opcoes": {"A":"...","B":"...","C":"...","D":"..."}, '
+        '"correta": "A|B|C|D", "explicacao": "por que, 1-2 frases", "pagina": "X"}. '
+        'As alternativas erradas devem ser plausíveis.'
     ),
     "dissertativa": (
-        "Gere questões DISSERTATIVAS abertas. Para cada uma: a pergunta e, em seguida, um GABARITO "
-        "COMENTADO com os pontos-chave que a resposta deve conter, citando a página [p.X]."
+        'Formato DISSERTATIVA aberta. Retorne um ARRAY JSON. Cada item: '
+        '{"q": "pergunta aberta", "gabarito": "pontos-chave que a resposta deve conter", "pagina": "X"}.'
     ),
     "flashcard": (
-        "Gere FLASHCARDS de revisão. Cada cartão: FRENTE (pergunta curta e objetiva) e VERSO "
-        "(resposta concisa), com a página [p.X] no verso. Ideal para repetição espaçada."
+        'Formato FLASHCARD. Retorne um ARRAY JSON. Cada item: '
+        '{"frente": "pergunta curta", "verso": "resposta concisa", "pagina": "X"}.'
     ),
     "caso": (
-        "Gere CASOS CLÍNICOS de joelho. Cada caso: uma vinheta clínica curta (idade, quadro, achados) "
-        "seguida de 2–3 perguntas de conduta/diagnóstico, e depois o GABARITO COMENTADO com a página [p.X]."
+        'Formato CASO CLÍNICO. Retorne um ARRAY JSON. Cada item: '
+        '{"q": "vinheta clínica curta + 2-3 perguntas de conduta/diagnóstico", '
+        '"gabarito": "conduta correta comentada", "pagina": "X"}.'
     ),
 }
 
+def _parse_json_itens(texto: str):
+    """Extrai o array JSON da resposta do modelo (tolera cercas ``` e texto ao redor)."""
+    import json, re
+    t = texto.strip()
+    t = re.sub(r'^```(?:json)?\s*', '', t)
+    t = re.sub(r'\s*```$', '', t)
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r'\[.*\]', t, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
 @app.post("/insall-quiz")
 async def insall_quiz(req: InsallQuizRequest, request: Request):
-    """Modo Estudar: gera questões ancoradas no Insall. Auth: JWT + allowlist."""
+    """Modo Estudar: gera questões ancoradas no Insall. Auth: JWT + allowlist.
+    Retorna itens estruturados (JSON) para a tela interativa de correção."""
     user = validar_usuario_supabase(request)
     _insall_autorizado(user)
     verificar_rate_limit(ip_do_cliente(request))
@@ -924,19 +951,21 @@ async def insall_quiz(req: InsallQuizRequest, request: Request):
         raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
 
     fmt = (req.formato or "").strip().lower()
-    if fmt not in _QUIZ_FORMATOS:
+    if fmt not in _QUIZ_SCHEMA:
         raise HTTPException(status_code=400, detail="Formato inválido.")
     n = req.n if req.n in (5, 10, 15) else 5
 
-    # Escopo: capítulo específico OU tema livre
-    if req.capitulo_num:
-        contexto = _chunks_do_capitulo(int(req.capitulo_num))
-        escopo_txt = f"capítulo {req.capitulo_num}"
+    # Escopo: capítulos (um ou vários) OU tema livre
+    caps = req.capitulos or ([req.capitulo_num] if req.capitulo_num else [])
+    caps = [int(c) for c in caps if c]
+    if caps:
+        contexto = _chunks_de_capitulos(caps)
+        escopo_txt = "capítulo " + ", ".join(str(c) for c in caps)
     elif (req.tema or "").strip():
         contexto = buscar_insall(req.tema.strip())
         escopo_txt = f"tema: {req.tema.strip()}"
     else:
-        raise HTTPException(status_code=400, detail="Escolha um capítulo ou informe um tema.")
+        raise HTTPException(status_code=400, detail="Escolha ao menos um capítulo ou informe um tema.")
 
     if not contexto:
         raise HTTPException(status_code=404, detail="Não encontrei conteúdo para esse escopo no livro.")
@@ -944,25 +973,31 @@ async def insall_quiz(req: InsallQuizRequest, request: Request):
     system = (
         "Você é um tutor de ortopedia que elabora questões de estudo para um MÉDICO ORTOPEDISTA, "
         "baseadas EXCLUSIVAMENTE nos trechos do Insall & Scott — Surgery of the Knee (6ª ed.) "
-        "fornecidos abaixo. NÃO invente conteúdo fora dos trechos. Cada questão deve citar a página "
-        "no formato [p.X]. Responda em português do Brasil (termos técnicos podem ficar em inglês).\n\n"
-        + _QUIZ_FORMATOS[fmt]
-        + f"\n\nGere EXATAMENTE {n} itens, numerados. Separe claramente pergunta e resposta/gabarito.\n\n"
+        "fornecidos abaixo. NÃO invente conteúdo fora dos trechos. O campo \"pagina\" deve refletir "
+        "a página citada no trecho usado. Escreva em português do Brasil (termos técnicos podem ficar "
+        "em inglês).\n\n"
+        + _QUIZ_SCHEMA[fmt]
+        + f"\n\nGere EXATAMENTE {n} itens. RESPONDA APENAS COM O ARRAY JSON, sem texto antes ou depois, "
+        "sem cercas de código.\n\n"
         "══════════════════════════════\nTRECHOS DO LIVRO (fonte única):\n\n"
         + contexto
         + "\n══════════════════════════════"
     )
-    msgs = [{"role": "user", "content": f"Gere {n} itens de estudo ({fmt}) sobre {escopo_txt}."}]
+    msgs = [{"role": "user", "content": f"Gere {n} itens ({fmt}) sobre {escopo_txt}. Apenas o JSON."}]
     print(f"[insall-quiz] fmt={fmt} n={n} escopo={escopo_txt} ctx={len(contexto)} chars")
 
     try:
         texto = _chamar_claude({
             "model": MODELO_SONNET,
-            "max_tokens": 4000,
+            "max_tokens": 4500,
             "system": system,
             "messages": msgs,
         })
-        return {"questoes": texto, "escopo": escopo_txt, "formato": fmt, "n": n}
+        itens = _parse_json_itens(texto)
+        if not itens:
+            # fallback: devolve texto cru para a tela exibir sem interação
+            return {"itens": None, "texto": texto, "formato": fmt, "escopo": escopo_txt, "n": n}
+        return {"itens": itens, "formato": fmt, "escopo": escopo_txt, "n": len(itens)}
     except anthropic.APIStatusError as e:
         print(f"[insall-quiz] APIStatusError {e.status_code}: {str(e.message)[:300]}")
         raise HTTPException(status_code=502, detail="Serviço de IA indisponível. Tente novamente.")
