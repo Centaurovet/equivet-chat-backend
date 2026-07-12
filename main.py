@@ -631,6 +631,12 @@ class InsallRequest(BaseModel):
     pergunta: str
     contexto: Optional[str] = None   # opcional: caso clínico para enriquecer a busca
 
+class InsallQuizRequest(BaseModel):
+    formato: str                       # "multipla" | "dissertativa" | "flashcard" | "caso"
+    n: int = 5                         # número de questões (5/10/15)
+    capitulo_num: Optional[int] = None  # número do capítulo (escopo por capítulo)
+    tema: Optional[str] = None          # tema livre (escopo por busca semântica)
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def raiz():
@@ -853,6 +859,115 @@ async def insall(req: InsallRequest, request: Request):
         raise HTTPException(status_code=502, detail="Serviço de IA indisponível. Tente novamente.")
     except Exception as e:
         print(f"[insall] erro: {type(e).__name__} {str(e)[:300]}")
+        raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
+# ── Insall — modo Estudar (geração de questões) ──────────────────────────────
+def _chunks_do_capitulo(cap_num: int) -> str:
+    """Puxa trechos de um capítulo específico e monta um contexto amostrado."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return ""
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        res = (sb.table("insall")
+               .select("capitulo,pagina,pdf_page,texto")
+               .ilike("capitulo", f"Cap. {cap_num} —%")
+               .limit(400).execute())
+        rows = res.data or []
+        if not rows:
+            return ""
+        # amostra uniforme ao longo do capítulo para caber no contexto
+        alvo = 28000
+        passo = max(1, len(rows) // 40)
+        amostra = rows[::passo]
+        linhas, acc = [], 0
+        for r in amostra:
+            pag = r.get("pagina") or (f"PDF {r.get('pdf_page')}" if r.get("pdf_page") else "")
+            texto = (r.get("texto") or "")[:1600]
+            linha = f"[p.{pag}] {texto}"
+            if acc + len(linha) > alvo:
+                break
+            linhas.append(linha); acc += len(linha)
+        return "\n\n".join(linhas)
+    except Exception as e:
+        print(f"[insall-quiz] capítulo falhou: {type(e).__name__} {str(e)[:200]}")
+        return ""
+
+_QUIZ_FORMATOS = {
+    "multipla": (
+        "Gere questões de MÚLTIPLA ESCOLHA no estilo de prova de título/residência de ortopedia. "
+        "Para cada questão: enunciado claro, 4 alternativas (A–D) plausíveis, indique a CORRETA e "
+        "explique por que em 1–2 frases, citando a página [p.X]."
+    ),
+    "dissertativa": (
+        "Gere questões DISSERTATIVAS abertas. Para cada uma: a pergunta e, em seguida, um GABARITO "
+        "COMENTADO com os pontos-chave que a resposta deve conter, citando a página [p.X]."
+    ),
+    "flashcard": (
+        "Gere FLASHCARDS de revisão. Cada cartão: FRENTE (pergunta curta e objetiva) e VERSO "
+        "(resposta concisa), com a página [p.X] no verso. Ideal para repetição espaçada."
+    ),
+    "caso": (
+        "Gere CASOS CLÍNICOS de joelho. Cada caso: uma vinheta clínica curta (idade, quadro, achados) "
+        "seguida de 2–3 perguntas de conduta/diagnóstico, e depois o GABARITO COMENTADO com a página [p.X]."
+    ),
+}
+
+@app.post("/insall-quiz")
+async def insall_quiz(req: InsallQuizRequest, request: Request):
+    """Modo Estudar: gera questões ancoradas no Insall. Auth: JWT + allowlist."""
+    user = validar_usuario_supabase(request)
+    _insall_autorizado(user)
+    verificar_rate_limit(ip_do_cliente(request))
+
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
+
+    fmt = (req.formato or "").strip().lower()
+    if fmt not in _QUIZ_FORMATOS:
+        raise HTTPException(status_code=400, detail="Formato inválido.")
+    n = req.n if req.n in (5, 10, 15) else 5
+
+    # Escopo: capítulo específico OU tema livre
+    if req.capitulo_num:
+        contexto = _chunks_do_capitulo(int(req.capitulo_num))
+        escopo_txt = f"capítulo {req.capitulo_num}"
+    elif (req.tema or "").strip():
+        contexto = buscar_insall(req.tema.strip())
+        escopo_txt = f"tema: {req.tema.strip()}"
+    else:
+        raise HTTPException(status_code=400, detail="Escolha um capítulo ou informe um tema.")
+
+    if not contexto:
+        raise HTTPException(status_code=404, detail="Não encontrei conteúdo para esse escopo no livro.")
+
+    system = (
+        "Você é um tutor de ortopedia que elabora questões de estudo para um MÉDICO ORTOPEDISTA, "
+        "baseadas EXCLUSIVAMENTE nos trechos do Insall & Scott — Surgery of the Knee (6ª ed.) "
+        "fornecidos abaixo. NÃO invente conteúdo fora dos trechos. Cada questão deve citar a página "
+        "no formato [p.X]. Responda em português do Brasil (termos técnicos podem ficar em inglês).\n\n"
+        + _QUIZ_FORMATOS[fmt]
+        + f"\n\nGere EXATAMENTE {n} itens, numerados. Separe claramente pergunta e resposta/gabarito.\n\n"
+        "══════════════════════════════\nTRECHOS DO LIVRO (fonte única):\n\n"
+        + contexto
+        + "\n══════════════════════════════"
+    )
+    msgs = [{"role": "user", "content": f"Gere {n} itens de estudo ({fmt}) sobre {escopo_txt}."}]
+    print(f"[insall-quiz] fmt={fmt} n={n} escopo={escopo_txt} ctx={len(contexto)} chars")
+
+    try:
+        texto = _chamar_claude({
+            "model": MODELO_SONNET,
+            "max_tokens": 4000,
+            "system": system,
+            "messages": msgs,
+        })
+        return {"questoes": texto, "escopo": escopo_txt, "formato": fmt, "n": n}
+    except anthropic.APIStatusError as e:
+        print(f"[insall-quiz] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível. Tente novamente.")
+    except Exception as e:
+        print(f"[insall-quiz] erro: {type(e).__name__} {str(e)[:300]}")
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
 
 @app.post("/analisar-sangue")
