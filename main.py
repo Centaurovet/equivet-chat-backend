@@ -627,6 +627,10 @@ class PdfLabRequest(BaseModel):
     pdf_base64: str          # PDF do laboratório em base64 (sem o prefixo data:)
     schema_valores: str      # IDs aceitos do formulário, montados no frontend
 
+class InsallRequest(BaseModel):
+    pergunta: str
+    contexto: Optional[str] = None   # opcional: caso clínico para enriquecer a busca
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def raiz():
@@ -721,6 +725,134 @@ async def literatura(req: LiteraturaRequest, request: Request):
         raise HTTPException(status_code=502, detail="Serviço de IA indisponível no momento. Tente novamente.")
     except Exception as e:
         print(f"[literatura] erro não tratado: tipo={type(e).__name__} msg={str(e)[:300]}")
+        raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
+# ════════════════════════════════════════════════════════════════════════════
+# INSALL & SCOTT — consulta de ortopedia (uso PESSOAL, base separada `insall`)
+# Não faz parte do produto veterinário; RAG isolado da literatura equina.
+# Acesso restrito por e-mail (INSALL_ALLOWED_EMAILS). Não conta na cota de IA.
+# ════════════════════════════════════════════════════════════════════════════
+_INSALL_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("INSALL_ALLOWED_EMAILS", "").split(",")
+    if e.strip()
+}
+
+def _insall_autorizado(user):
+    """Portão de acesso: se INSALL_ALLOWED_EMAILS estiver definido, só e-mails
+    da lista podem consultar. Vazio = qualquer usuário autenticado (dev)."""
+    if not _INSALL_EMAILS:
+        return
+    email = (getattr(user, "email", "") or "").strip().lower()
+    if email not in _INSALL_EMAILS:
+        raise HTTPException(status_code=403, detail="Acesso não autorizado a esta base.")
+
+def _formatar_chunks_insall(chunks: list) -> str:
+    """Formata trechos do Insall para o system prompt, com ref [Insall 6ª ed., cap., p.]."""
+    linhas = []
+    acumulado = 0
+    for r in chunks[:RAG_CHUNKS]:
+        cap = r.get("capitulo") or ""
+        pag = r.get("pagina")
+        ref = "Insall & Scott, 6ª ed."
+        if cap:
+            ref += f" — {cap}"
+        if pag:
+            ref += f", p.{pag}"
+        elif r.get("pdf_page"):
+            ref += f", p.PDF {r.get('pdf_page')}"
+        texto = (r.get("texto") or "")[:RAG_CHUNK_CHAR_MAX]
+        linha = f"[{ref}]\n{texto}"
+        if acumulado + len(linha) > RAG_CONTEXT_CHAR_MAX:
+            break
+        linhas.append(linha)
+        acumulado += len(linha) + 8
+    return "\n\n---\n\n".join(linhas)
+
+def buscar_insall(pergunta: str) -> str:
+    """Busca vetorial (Cohere + pgvector match_insall) na base do Insall."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not COHERE_API_KEY:
+        return ""
+    try:
+        import cohere
+        from supabase import create_client
+        co = cohere.Client(api_key=COHERE_API_KEY)
+        emb = co.embed(texts=[pergunta], model="embed-multilingual-v3.0",
+                       input_type="search_query").embeddings[0]
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        res = sb.rpc("match_insall", {
+            "query_embedding": emb,
+            "match_count": RAG_CHUNKS * 2,
+        }).execute()
+        if not res.data:
+            return ""
+        relevantes = [r for r in res.data if (r.get("similarity") or 0) >= RAG_SIM_MIN][:RAG_CHUNKS]
+        return _formatar_chunks_insall(relevantes) if relevantes else ""
+    except Exception as e:
+        print(f"[insall] busca falhou: {type(e).__name__} {str(e)[:200]}")
+        return ""
+
+_SYSTEM_INSALL = (
+    "PERSONA: Você é um assistente de consulta ao tratado Insall & Scott — Surgery of the "
+    "Knee, 6ª edição (2017), referência de cirurgia e ortopedia do joelho. Você conversa com "
+    "um MÉDICO ORTOPEDISTA brasileiro. Use linguagem técnica precisa (nomenclatura anatômica, "
+    "termos cirúrgicos, classificações). Seja direto e denso, como um colega consultando outro.\n\n"
+    "FONTE: Baseie-se ESTRITAMENTE nos trechos do livro fornecidos abaixo. Cite sempre a "
+    "referência no formato [Insall & Scott 6ª ed., cap. X, p.Y] ao afirmar algo. Se os trechos "
+    "não cobrirem a pergunta, diga com clareza que o material recuperado não trata do ponto — "
+    "NÃO invente e não preencha com conhecimento geral sem sinalizar que é externo ao livro. "
+    "Responda em português do Brasil (mantendo termos técnicos em inglês/latim quando padrão). "
+    "Seja conciso; use bullets ao listar classificações, indicações ou passos cirúrgicos."
+)
+
+@app.post("/insall")
+async def insall(req: InsallRequest, request: Request):
+    """Consulta pessoal ao Insall & Scott. Auth: JWT Supabase + allowlist de e-mail."""
+    user = validar_usuario_supabase(request)
+    _insall_autorizado(user)
+    verificar_rate_limit(ip_do_cliente(request))
+
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
+
+    pergunta = (req.pergunta or "").strip()
+    if not pergunta:
+        raise HTTPException(status_code=400, detail="Pergunta vazia.")
+    if len(pergunta) > MAX_PERGUNTA_CHARS:
+        raise HTTPException(status_code=413, detail="Pergunta longa demais.")
+
+    contexto = (req.contexto or "").strip()[:MAX_CONTEXTO_CHARS]
+    texto_busca = (contexto + "\n\n" + pergunta).strip() if contexto else pergunta
+
+    trechos = buscar_insall(texto_busca)
+    system = _SYSTEM_INSALL
+    if trechos:
+        system += (
+            "\n\n══════════════════════════════\n"
+            "TRECHOS DO LIVRO (fonte primária — cite [Insall & Scott 6ª ed., cap., p.]):\n\n"
+            + trechos
+            + "\n══════════════════════════════"
+        )
+
+    conteudo_user = (
+        ("CASO CLÍNICO:\n" + contexto + "\n\nPERGUNTA:\n" + pergunta) if contexto else pergunta
+    )
+    msgs = [{"role": "user", "content": conteudo_user}]
+    print(f"[insall] system={len(system)} chars, trechos={'sim' if trechos else 'nao'}")
+
+    try:
+        texto = _chamar_claude({
+            "model": MODELO_SONNET,
+            "max_tokens": MAX_TOKENS,
+            "system": system,
+            "messages": msgs,
+        })
+        return {"resposta": texto, "tem_literatura": bool(trechos)}
+    except anthropic.APIStatusError as e:
+        print(f"[insall] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível. Tente novamente.")
+    except Exception as e:
+        print(f"[insall] erro: {type(e).__name__} {str(e)[:300]}")
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
 
 @app.post("/analisar-sangue")
