@@ -1072,8 +1072,14 @@ async def insall_resumo(req: InsallResumoRequest, request: Request):
     if not contexto:
         raise HTTPException(status_code=404, detail="Não encontrei conteúdo para esse escopo no livro.")
 
-    system = _resumo_system(extensao, escopo_txt)
-    msgs = [{"role": "user", "content": f"Escreva o resumo ({extensao}) sobre {escopo_txt}."}]
+    system = (
+        _resumo_system(extensao, escopo_txt)
+        + "\n\n══════════════════════════════\nTRECHOS DO LIVRO (fonte única — não use "
+        "conhecimento externo a eles):\n\n"
+        + contexto
+        + "\n══════════════════════════════"
+    )
+    msgs = [{"role": "user", "content": f"Escreva o resumo ({extensao}) sobre {escopo_txt}. Baseie-se exclusivamente nos trechos fornecidos no system prompt."}]
     print(f"[insall-resumo] extensao={extensao} escopo={escopo_txt} ctx={len(contexto)} chars")
 
     try:
