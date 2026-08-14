@@ -638,6 +638,11 @@ class InsallQuizRequest(BaseModel):
     capitulo_num: Optional[int] = None     # compat: capítulo único
     tema: Optional[str] = None             # tema livre (escopo por busca semântica)
 
+class InsallResumoRequest(BaseModel):
+    capitulos: Optional[List[int]] = None  # um ou mais capítulos (escopo por capítulo)
+    tema: Optional[str] = None             # tema livre (escopo por busca semântica)
+    extensao: str = "medio"                # "curto" | "medio" | "longo"
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 def raiz():
@@ -863,7 +868,7 @@ async def insall(req: InsallRequest, request: Request):
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
 
 # ── Insall — modo Estudar (geração de questões) ──────────────────────────────
-def _chunks_de_capitulos(nums: list) -> str:
+def _chunks_de_capitulos(nums: list, alvo_total: int = 30000) -> str:
     """Puxa trechos de um ou mais capítulos e monta um contexto amostrado,
     dividindo o orçamento de contexto igualmente entre os capítulos."""
     if not SUPABASE_URL or not SUPABASE_KEY or not nums:
@@ -871,7 +876,6 @@ def _chunks_de_capitulos(nums: list) -> str:
     try:
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        alvo_total = 30000
         por_cap = max(4000, alvo_total // len(nums))
         blocos = []
         for cap_num in nums:
@@ -1003,6 +1007,88 @@ async def insall_quiz(req: InsallQuizRequest, request: Request):
         raise HTTPException(status_code=502, detail="Serviço de IA indisponível. Tente novamente.")
     except Exception as e:
         print(f"[insall-quiz] erro: {type(e).__name__} {str(e)[:300]}")
+        raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
+
+# ── Insall — modo Resumo (síntese de capítulo(s) ou tema livre) ──────────────
+_RESUMO_EXTENSAO = {
+    "curto": (
+        "RESUMO CURTO: até ~250 palavras. Só os pontos essenciais — definição, achados-chave "
+        "e conduta principal — em texto corrido ou bullets curtos."
+    ),
+    "medio": (
+        "RESUMO MÉDIO: ~500-700 palavras. Organize em tópicos com **negrito** nos subtítulos "
+        "(ex: **Anatomia**, **Classificação**, **Diagnóstico**, **Tratamento**), cobrindo os "
+        "pontos principais sem se aprofundar em cada detalhe."
+    ),
+    "longo": (
+        "RESUMO COMPLETO: ~1200-1800 palavras. Cubra o assunto com profundidade — organize em "
+        "tópicos com **negrito** nos subtítulos, incluindo classificações, técnicas, "
+        "indicações/contraindicações e complicações quando presentes nos trechos."
+    ),
+}
+_RESUMO_MAX_TOKENS = {"curto": 1200, "medio": 2600, "longo": 4500}
+_RESUMO_CTX_CHARS = {"curto": 30000, "medio": 45000, "longo": 65000}
+
+def _resumo_system(extensao: str, escopo_txt: str) -> str:
+    return (
+        "PERSONA: Você é um redator médico que produz resumos de estudo do tratado Insall & "
+        "Scott — Surgery of the Knee, 6ª edição, para um MÉDICO ORTOPEDISTA brasileiro "
+        "revisando o assunto. Use linguagem técnica precisa (nomenclatura anatômica, termos "
+        "cirúrgicos, classificações).\n\n"
+        "FONTE: baseie-se ESTRITAMENTE nos trechos do livro fornecidos abaixo — não invente "
+        "nem complete com conhecimento externo. Cite a página entre colchetes, ex. [p.123], "
+        "junto dos pontos mais relevantes (não é preciso citar cada frase).\n\n"
+        + _RESUMO_EXTENSAO.get(extensao, _RESUMO_EXTENSAO["medio"])
+        + f"\n\nEscopo deste resumo: {escopo_txt}. Responda em português do Brasil (termos "
+        "técnicos podem ficar em inglês/latim quando for o padrão)."
+    )
+
+@app.post("/insall-resumo")
+async def insall_resumo(req: InsallResumoRequest, request: Request):
+    """Modo Resumo: sintetiza um ou mais capítulos, ou um tema livre, a partir do Insall.
+    Auth: JWT + allowlist. Não conta na cota de IA do EquiVet."""
+    user = validar_usuario_supabase(request)
+    _insall_autorizado(user)
+    verificar_rate_limit(ip_do_cliente(request))
+
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API Key não configurada no servidor.")
+
+    extensao = (req.extensao or "medio").strip().lower()
+    if extensao not in _RESUMO_EXTENSAO:
+        extensao = "medio"
+    ctx_budget = _RESUMO_CTX_CHARS.get(extensao, 45000)
+
+    caps = [int(c) for c in (req.capitulos or []) if c]
+    if caps:
+        contexto = _chunks_de_capitulos(caps, alvo_total=ctx_budget)
+        escopo_txt = "capítulo " + ", ".join(str(c) for c in caps)
+    elif (req.tema or "").strip():
+        contexto = buscar_insall(req.tema.strip())
+        escopo_txt = f"tema: {req.tema.strip()}"
+    else:
+        raise HTTPException(status_code=400, detail="Escolha ao menos um capítulo ou informe um tema.")
+
+    if not contexto:
+        raise HTTPException(status_code=404, detail="Não encontrei conteúdo para esse escopo no livro.")
+
+    system = _resumo_system(extensao, escopo_txt)
+    msgs = [{"role": "user", "content": f"Escreva o resumo ({extensao}) sobre {escopo_txt}."}]
+    print(f"[insall-resumo] extensao={extensao} escopo={escopo_txt} ctx={len(contexto)} chars")
+
+    try:
+        texto = _chamar_claude({
+            "model": MODELO_SONNET,
+            "max_tokens": _RESUMO_MAX_TOKENS.get(extensao, 2600),
+            "system": system,
+            "messages": msgs,
+        })
+        return {"resumo": texto, "escopo": escopo_txt, "extensao": extensao}
+    except anthropic.APIStatusError as e:
+        print(f"[insall-resumo] APIStatusError {e.status_code}: {str(e.message)[:300]}")
+        raise HTTPException(status_code=502, detail="Serviço de IA indisponível. Tente novamente.")
+    except Exception as e:
+        print(f"[insall-resumo] erro: {type(e).__name__} {str(e)[:300]}")
         raise HTTPException(status_code=500, detail="Erro interno. Tente novamente.")
 
 @app.post("/analisar-sangue")
